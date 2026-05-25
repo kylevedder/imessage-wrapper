@@ -20,6 +20,17 @@ class ContactWritePayload:
     emails: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class ContactUpdatePayload:
+    first_name: str | None = None
+    last_name: str | None = None
+    middle_name: str | None = None
+    nickname: str | None = None
+    organization: str | None = None
+    phones: tuple[str, ...] | None = None
+    emails: tuple[str, ...] | None = None
+
+
 class ContactsWriter:
     def _contacts_module(self) -> Any:
         if sys.platform != "darwin":
@@ -45,7 +56,7 @@ class ContactsWriter:
             raise ContactsWriteError(str(error) if error else "Contacts create failed")
         return str(contact.identifier())
 
-    def update_contact(self, contact_id: str, payload: ContactWritePayload) -> str:
+    def update_contact(self, contact_id: str, payload: ContactUpdatePayload) -> str:
         Contacts = self._contacts_module()
         store = Contacts.CNContactStore.alloc().init()
         keys = [
@@ -61,7 +72,7 @@ class ContactsWriter:
         if contact is None:
             raise ContactsWriteError(str(error) if error else f"Contact not found: {contact_id}")
         mutable = contact.mutableCopy()
-        self._apply_payload(mutable, payload, Contacts)
+        self._apply_update_payload(mutable, payload, Contacts)
         request = Contacts.CNSaveRequest.alloc().init()
         request.updateContact_(mutable)
         ok, error = store.executeSaveRequest_error_(request, None)
@@ -89,3 +100,31 @@ class ContactsWriter:
         ]
         contact.setPhoneNumbers_(phone_values)
         contact.setEmailAddresses_(email_values)
+
+    def _apply_update_payload(self, contact: Any, payload: ContactUpdatePayload, Contacts: Any) -> None:
+        if payload.first_name is not None:
+            contact.setGivenName_(payload.first_name)
+        if payload.middle_name is not None:
+            contact.setMiddleName_(payload.middle_name)
+        if payload.last_name is not None:
+            contact.setFamilyName_(payload.last_name)
+        if payload.nickname is not None:
+            contact.setNickname_(payload.nickname)
+        if payload.organization is not None:
+            contact.setOrganizationName_(payload.organization)
+        if payload.phones is not None:
+            phone_values = []
+            for phone in payload.phones:
+                number = Contacts.CNPhoneNumber.phoneNumberWithStringValue_(phone)
+                labeled = Contacts.CNLabeledValue.labeledValueWithLabel_value_(
+                    Contacts.CNLabelPhoneNumberMobile,
+                    number,
+                )
+                phone_values.append(labeled)
+            contact.setPhoneNumbers_(phone_values)
+        if payload.emails is not None:
+            email_values = [
+                Contacts.CNLabeledValue.labeledValueWithLabel_value_(Contacts.CNLabelHome, email)
+                for email in payload.emails
+            ]
+            contact.setEmailAddresses_(email_values)

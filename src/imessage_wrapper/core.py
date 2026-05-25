@@ -196,9 +196,10 @@ def _lookup_match_score(query: str, values: list[Any]) -> int | None:
 def _extract_attributed_body_text(value: bytes | None) -> str:
     if not value:
         return ""
-    candidates = re.findall(rb"[\x20-\x7e]{2,}", value)
+    decoded = unicodedata.normalize("NFC", value.decode("utf-8", "ignore"))
+    candidates = re.findall(r"[^\x00-\x08\x0b-\x1f\x7f]{2,}", decoded)
     for item in candidates:
-        text = item.decode("utf-8", "ignore").strip()
+        text = item.strip()
         if not text or text in _ATTRIBUTED_BODY_EXCLUDED:
             continue
         for excluded in _ATTRIBUTED_BODY_EXCLUDED:
@@ -209,13 +210,13 @@ def _extract_attributed_body_text(value: bytes | None) -> str:
             marker = text.find(excluded)
             if marker > 0:
                 text = text[:marker].strip()
-        text = re.sub(r"^[^A-Za-z0-9(]+", "", text)
+        text = text.lstrip("!\"#$%&'*+,-./:;<=>?@[\\]^_`{|}~")
         text = text.strip()
         if not text or text in _ATTRIBUTED_BODY_EXCLUDED:
             continue
         if any(excluded in text for excluded in _ATTRIBUTED_BODY_EXCLUDED_SUBSTRINGS):
             continue
-        if not re.search(r"[A-Za-z]", text):
+        if not any(unicodedata.category(ch)[0] in {"L", "N", "S"} for ch in text):
             continue
         return text
     return ""
@@ -1223,27 +1224,16 @@ end sendPayload
                 f"Refusing duplicate image send for {recipient}; matching recent attachment {duplicate_match}"
             )
         start = time.monotonic()
-        env_summary = {
-            "cwd": str(Path.cwd()),
-            "home": os.environ.get("HOME", ""),
-            "path": os.environ.get("PATH", ""),
-            "python_executable": os.environ.get("PYTHONEXECUTABLE", ""),
-            "send_mode": os.environ.get("IMESSAGE_WRAPPER_SEND_MODE", ""),
-        }
         subprocess_env = {
             "PATH": os.environ.get("PATH", ""),
             "HOME": str(_host_home()),
         }
-        message_preview = message[:80].replace("\n", "\\n")
         log.info(
-            "Starting AppleScript iMessage send recipient=%s message_len=%d image_count=%d preview=%r timeout=%ss env=%s subprocess_env=%s",
-            script_recipient,
+            "Starting AppleScript iMessage send target_kind=%s message_len=%d image_count=%d timeout=%ss",
+            verification_target[0],
             len(message),
             len(prepared_images),
-            message_preview,
             self.timeout_seconds,
-            env_summary,
-            subprocess_env,
         )
         send_image_paths = self._stage_send_attachments(prepared_images)
         try:
@@ -1261,23 +1251,25 @@ end sendPayload
             stdout = (exc.stdout or "").strip() if isinstance(exc.stdout, str) else ""
             stderr = (exc.stderr or "").strip() if isinstance(exc.stderr, str) else ""
             log.error(
-                "AppleScript iMessage send timed out recipient=%s elapsed=%.3fs stdout=%r stderr=%r",
-                script_recipient,
+                "AppleScript iMessage send timed out target_kind=%s elapsed=%.3fs stdout_len=%d stderr_len=%d",
+                verification_target[0],
                 elapsed,
-                stdout,
-                stderr,
+                len(stdout),
+                len(stderr),
             )
             raise IMessageError(f"Timed out sending iMessage after {self.timeout_seconds}s") from exc
         except subprocess.CalledProcessError as exc:
             details = (exc.stderr or exc.stdout or "").strip() or "unknown AppleScript error"
             elapsed = time.monotonic() - start
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
             log.error(
-                "AppleScript iMessage send failed recipient=%s elapsed=%.3fs returncode=%s stdout=%r stderr=%r",
-                script_recipient,
+                "AppleScript iMessage send failed target_kind=%s elapsed=%.3fs returncode=%s stdout_len=%d stderr_len=%d",
+                verification_target[0],
                 elapsed,
                 exc.returncode,
-                exc.stdout,
-                exc.stderr,
+                len(stdout),
+                len(stderr),
             )
             raise IMessageError(f"Messages send failed: {details}") from exc
         output = (completed.stdout or "").strip()
@@ -1291,26 +1283,22 @@ end sendPayload
         )
         if verified is None:
             log.warning(
-                "AppleScript iMessage send completed but verification was unavailable recipient=%s target_kind=%s target_value=%s",
-                script_recipient,
+                "AppleScript iMessage send completed but verification was unavailable target_kind=%s",
                 verification_target[0],
-                verification_target[1],
             )
         elif verified is False:
             log.warning(
-                "AppleScript iMessage send completed but verification timed out recipient=%s target_kind=%s target_value=%s",
-                script_recipient,
+                "AppleScript iMessage send completed but verification timed out target_kind=%s",
                 verification_target[0],
-                verification_target[1],
             )
         elapsed = time.monotonic() - start
         log.info(
-            "AppleScript iMessage send completed recipient=%s elapsed=%.3fs returncode=%s stdout=%r stderr=%r",
-            script_recipient,
+            "AppleScript iMessage send completed target_kind=%s elapsed=%.3fs returncode=%s stdout_len=%d stderr_len=%d",
+            verification_target[0],
             elapsed,
             completed.returncode,
-            completed.stdout,
-            completed.stderr,
+            len(completed.stdout or ""),
+            len(completed.stderr or ""),
         )
         return {
             "mode": "live",
@@ -1397,7 +1385,7 @@ end sendPayload
             target = staging_dir / f"{uuid4()}-{source.name}"
             shutil.copy2(source, target)
             staged.append(str(target))
-        log.info("Staged iMessage attachments source_paths=%s staged_paths=%s", image_paths, staged)
+        log.info("Staged iMessage attachments count=%d", len(staged))
         return staged
 
     def _latest_chat_message_rowid(self, chat_guid: str) -> int:
@@ -1572,11 +1560,8 @@ end sendPayload
             for existing_path, existing_digest in seen_hashes.items():
                 if digest == existing_digest:
                     log.info(
-                        "Blocked duplicate iMessage attachment target_kind=%s target_value=%s source_path=%s existing_path=%s",
+                        "Blocked duplicate iMessage attachment target_kind=%s",
                         target_kind,
-                        target_value,
-                        source_path,
-                        existing_path,
                     )
                     return existing_path
         return None
@@ -1605,9 +1590,8 @@ end sendPayload
                     return None
                 if visible:
                     log.info(
-                        "Verified iMessage send target_kind=%s target_value=%s min_rowid=%d min_attachment_rowid=%d image_count=%d",
+                        "Verified iMessage send target_kind=%s min_rowid=%d min_attachment_rowid=%d image_count=%d",
                         target_kind,
-                        target_value,
                         min_rowid,
                         min_attachment_rowid,
                         len(image_paths),
@@ -1615,9 +1599,8 @@ end sendPayload
                     return True
             except sqlite3.Error as exc:
                 log.warning(
-                    "Retrying send verification target_kind=%s target_value=%s after sqlite error: %s",
+                    "Retrying send verification target_kind=%s after sqlite error: %s",
                     target_kind,
-                    target_value,
                     exc,
                 )
             time.sleep(self.verification_poll_interval_seconds)

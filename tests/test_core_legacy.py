@@ -783,6 +783,18 @@ def test_extract_attributed_body_text_ignores_keyed_archive_metadata():
     assert _extract_attributed_body_text(payload) == "Archive metadata should not hide this message"
 
 
+def test_extract_attributed_body_text_recovers_unicode_message_text():
+    payload = "NSString\x01こんにちは\x00NSDictionary".encode()
+
+    assert _extract_attributed_body_text(payload) == "こんにちは"
+
+
+def test_extract_attributed_body_text_recovers_emoji_only_message_text():
+    payload = "NSString\x01🙂🙂\x00NSDictionary".encode()
+
+    assert _extract_attributed_body_text(payload) == "🙂🙂"
+
+
 def test_group_chat_identifier_helpers_detect_group_targets():
     assert _looks_like_group_chat_identifier("b99df106dc964e2e9e5439c4dc7396d4") is True
     assert _looks_like_group_chat_guid("any;+;b99df106dc964e2e9e5439c4dc7396d4") is True

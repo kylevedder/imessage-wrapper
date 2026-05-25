@@ -5,6 +5,7 @@ import subprocess
 from datetime import datetime, timezone
 
 from imessage_wrapper import IMessageClient
+from imessage_wrapper.contacts_writer import ContactUpdatePayload, ContactsWriter
 from imessage_wrapper.core import APPLE_EPOCH
 
 
@@ -293,6 +294,86 @@ def test_client_send_dry_run_uses_chat_id_target(tmp_path):
     assert result.recipient == "iMessage;-;+15550100001"
 
 
+def test_client_send_to_contact_email_preserves_requested_endpoint(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    contacts_db = tmp_path / "AddressBook-v22.abcddb"
+    make_messages_db(messages_db)
+    make_contacts_db(contacts_db)
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[contacts_db], home=tmp_path)
+    result = client.send(to="alex@example.test", text="hello from test", dry_run=True)
+
+    assert result.recipient == "alex@example.test"
+
+
+def test_client_update_contact_preserves_omitted_fields(tmp_path, monkeypatch):
+    captured = {}
+
+    class FakeContactsWriter:
+        def update_contact(self, contact_id, payload):
+            captured["contact_id"] = contact_id
+            captured["payload"] = payload
+            return "contact-1"
+
+    monkeypatch.setattr("imessage_wrapper.client.ContactsWriter", FakeContactsWriter)
+    client = IMessageClient(messages_db_path=tmp_path / "chat.db", contacts_db_paths=[], home=tmp_path)
+
+    result = client.update_contact("contact-1", first_name="Updated", phones=[])
+
+    assert result == "contact-1"
+    assert captured["contact_id"] == "contact-1"
+    assert captured["payload"].first_name == "Updated"
+    assert captured["payload"].last_name is None
+    assert captured["payload"].emails is None
+    assert captured["payload"].phones == ()
+
+
+def test_contacts_writer_update_payload_only_mutates_provided_fields():
+    class FakeContacts:
+        CNLabelHome = "home"
+        CNLabelPhoneNumberMobile = "mobile"
+
+        class CNPhoneNumber:
+            @staticmethod
+            def phoneNumberWithStringValue_(value):
+                return f"phone:{value}"
+
+        class CNLabeledValue:
+            @staticmethod
+            def labeledValueWithLabel_value_(label, value):
+                return (label, value)
+
+    class MutableContact:
+        def __init__(self):
+            self.calls = []
+
+        def setGivenName_(self, value):
+            self.calls.append(("first_name", value))
+
+        def setMiddleName_(self, value):
+            self.calls.append(("middle_name", value))
+
+        def setFamilyName_(self, value):
+            self.calls.append(("last_name", value))
+
+        def setNickname_(self, value):
+            self.calls.append(("nickname", value))
+
+        def setOrganizationName_(self, value):
+            self.calls.append(("organization", value))
+
+        def setPhoneNumbers_(self, value):
+            self.calls.append(("phones", value))
+
+        def setEmailAddresses_(self, value):
+            self.calls.append(("emails", value))
+
+    contact = MutableContact()
+    ContactsWriter()._apply_update_payload(contact, ContactUpdatePayload(first_name="Updated"), FakeContacts)
+
+    assert contact.calls == [("first_name", "Updated")]
+
+
 def test_client_live_send_verifies_inserted_row(tmp_path, monkeypatch):
     messages_db = tmp_path / "chat.db"
     make_messages_db(messages_db)
@@ -324,3 +405,89 @@ def test_client_live_send_verifies_inserted_row(tmp_path, monkeypatch):
     assert result.verified is True
     assert result.message_id == 2
     assert result.message_guid == "sent-guid"
+
+
+def test_client_live_send_does_not_verify_preexisting_same_text_row(tmp_path, monkeypatch):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    conn = sqlite3.connect(messages_db)
+    try:
+        conn.execute(
+            """
+            INSERT INTO message
+            VALUES (2, 'old-guid', 'repeat text', NULL, NULL, NULL, 'iMessage', ?, NULL, NULL,
+                    1, 1, NULL, NULL, NULL, NULL, 'me@example.test')
+            """,
+            (apple_ns(datetime.now(timezone.utc)),),
+        )
+        conn.execute("INSERT INTO chat_message_join VALUES (1, 2)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    def fake_run(cmd, input, text, capture_output, timeout, check, env):
+        return subprocess.CompletedProcess(cmd, 0, stdout="sent\n", stderr="")
+
+    ticks = iter([0.0, 0.0, 3.0])
+    monkeypatch.setattr("imessage_wrapper.client.subprocess.run", fake_run)
+    monkeypatch.setattr("imessage_wrapper.client.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("imessage_wrapper.client.time.sleep", lambda _: None)
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[], home=tmp_path)
+
+    result = client.send(chat_id=1, text="repeat text")
+
+    assert result.sent is True
+    assert result.verified is False
+    assert result.message_id is None
+
+
+def test_wait_for_sent_message_filters_by_direct_recipient(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    sent_at = datetime(2026, 5, 1, 12, 1, tzinfo=timezone.utc)
+    conn = sqlite3.connect(messages_db)
+    try:
+        conn.execute("INSERT INTO handle VALUES (2, '+15550100002', 'iMessage', '+1 (555) 010-0002')")
+        conn.execute(
+            """
+            INSERT INTO chat
+            VALUES (2, 'iMessage;-;+15550100002', '+15550100002', NULL, 'iMessage',
+                    'iMessage;+;me@example.test', 'me@example.test', '+15550100002')
+            """
+        )
+        conn.execute("INSERT INTO chat_handle_join VALUES (2, 2)")
+        conn.execute(
+            """
+            INSERT INTO message
+            VALUES (2, 'wrong-guid', 'collision text', NULL, NULL, 2, 'iMessage', ?, NULL, NULL,
+                    1, 1, NULL, NULL, NULL, NULL, 'me@example.test')
+            """,
+            (apple_ns(datetime(2026, 5, 1, 12, 1, 2, tzinfo=timezone.utc)),),
+        )
+        conn.execute("INSERT INTO chat_message_join VALUES (2, 2)")
+        conn.execute(
+            """
+            INSERT INTO message
+            VALUES (3, 'right-guid', 'collision text', NULL, NULL, 1, 'iMessage', ?, NULL, NULL,
+                    1, 1, NULL, NULL, NULL, NULL, 'me@example.test')
+            """,
+            (apple_ns(datetime(2026, 5, 1, 12, 1, 1, tzinfo=timezone.utc)),),
+        )
+        conn.execute("INSERT INTO chat_message_join VALUES (1, 3)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[], home=tmp_path)
+    message = client._wait_for_sent_message(
+        text="collision text",
+        chat_id=None,
+        chat_identifier=None,
+        chat_guid=None,
+        recipient="+15550100001",
+        min_rowid=0,
+        sent_at=sent_at,
+    )
+
+    assert message is not None
+    assert message.id == 3

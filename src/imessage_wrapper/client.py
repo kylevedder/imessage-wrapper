@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import mimetypes
 import os
 import select
 import shutil
@@ -14,7 +13,7 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 from . import core
-from .contacts_writer import ContactWritePayload, ContactsWriter
+from .contacts_writer import ContactUpdatePayload, ContactWritePayload, ContactsWriter
 from .models import (
     Attachment,
     Chat,
@@ -37,6 +36,7 @@ class _Schema:
     message: set[str]
     chat: set[str]
     chat_message_join: set[str]
+    handle: set[str]
 
 
 class IMessageClient:
@@ -422,7 +422,10 @@ class IMessageClient:
             return SendResult(recipient=target, text=text, file_paths=files, dry_run=True, sent=False, verified=False)
         if service not in {"auto", "imessage", "sms"}:
             raise ValueError("service must be 'auto', 'imessage', or 'sms'")
-        normalized_target = target if chat_id or chat_identifier or chat_guid else self._normalize_outbound_recipient(target, region or self.region)
+        use_chat = bool(chat_id or chat_identifier or chat_guid)
+        normalized_target = target if use_chat else self._normalize_outbound_recipient(target, region or self.region)
+        should_verify = verify if verify is not None else self.verify_sends
+        pre_send_rowid = self._latest_message_rowid() if should_verify else 0
         staged_files = self._stage_send_files(files)
         sent_at = datetime.now(timezone.utc)
         self._run_send_applescript(
@@ -430,14 +433,23 @@ class IMessageClient:
             text=text,
             file_paths=staged_files,
             service=service,
-            use_chat=bool(chat_id or chat_identifier or chat_guid),
+            use_chat=use_chat,
         )
-        self._raise_if_ghost_row(chat_identifier=chat_identifier or target, chat_guid=chat_guid or target, sent_at=sent_at)
+        if chat_identifier or chat_guid:
+            self._raise_if_ghost_row(chat_identifier=chat_identifier, chat_guid=chat_guid, sent_at=sent_at)
         verified = None
         message_id = None
         message_guid = None
-        if verify if verify is not None else self.verify_sends:
-            found = self._wait_for_sent_message(text=text, chat_id=chat_id, sent_at=sent_at)
+        if should_verify:
+            found = self._wait_for_sent_message(
+                text=text,
+                chat_id=chat_id,
+                chat_identifier=chat_identifier,
+                chat_guid=chat_guid,
+                recipient=None if use_chat else normalized_target,
+                min_rowid=pre_send_rowid,
+                sent_at=sent_at,
+            )
             verified = found is not None if text.strip() else None
             if found is not None:
                 message_id = found.id
@@ -477,24 +489,24 @@ class IMessageClient:
     def update_contact(
         self,
         contact_id: str,
-        first_name: str = "",
-        last_name: str = "",
-        middle_name: str = "",
-        nickname: str = "",
-        organization: str = "",
+        first_name: str | None = None,
+        last_name: str | None = None,
+        middle_name: str | None = None,
+        nickname: str | None = None,
+        organization: str | None = None,
         phones: list[str] | None = None,
         emails: list[str] | None = None,
     ) -> str:
         return ContactsWriter().update_contact(
             contact_id,
-            ContactWritePayload(
+            ContactUpdatePayload(
                 first_name=first_name,
                 last_name=last_name,
                 middle_name=middle_name,
                 nickname=nickname,
                 organization=organization,
-                phones=tuple(phones or ()),
-                emails=tuple(emails or ()),
+                phones=tuple(phones) if phones is not None else None,
+                emails=tuple(emails) if emails is not None else None,
             ),
         )
 
@@ -531,6 +543,7 @@ class IMessageClient:
             message=self._table_columns(conn, "message"),
             chat=self._table_columns(conn, "chat"),
             chat_message_join=self._table_columns(conn, "chat_message_join"),
+            handle=self._table_columns(conn, "handle"),
         )
 
     def _table_columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
@@ -538,6 +551,11 @@ class IMessageClient:
             return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         except sqlite3.Error:
             return set()
+
+    def _latest_message_rowid(self) -> int:
+        with self._connect_messages() as conn:
+            row = conn.execute("SELECT MAX(ROWID) AS max_rowid FROM message").fetchone()
+        return int(row["max_rowid"] or 0) if row else 0
 
     def _chat_routing_sql(self, schema: _Schema) -> str:
         return ", ".join(
@@ -904,12 +922,6 @@ class IMessageClient:
         if chat_identifier:
             return chat_identifier
         if to:
-            contact = self.resolve_contact(to)
-            if contact:
-                if contact.phones:
-                    return contact.phones[0].value
-                if contact.emails:
-                    return contact.emails[0].value
             return to
         raise ValueError("to, chat_id, chat_identifier, or chat_guid is required")
 
@@ -997,7 +1009,16 @@ end run
             details = (exc.stderr or exc.stdout or "").strip() or "unknown AppleScript error"
             raise core.IMessageError(f"Messages send failed: {details}") from exc
 
-    def _wait_for_sent_message(self, text: str, chat_id: int | None, sent_at: datetime) -> Message | None:
+    def _wait_for_sent_message(
+        self,
+        text: str,
+        chat_id: int | None,
+        chat_identifier: str | None,
+        chat_guid: str | None,
+        recipient: str | None,
+        min_rowid: int,
+        sent_at: datetime,
+    ) -> Message | None:
         if not text.strip():
             return None
         deadline = time.monotonic() + 2.0
@@ -1007,11 +1028,21 @@ end run
             with self._connect_messages() as conn:
                 schema = self._schema(conn)
                 select = self._message_select(schema)
-                where = ["m.is_from_me = 1", "COALESCE(m.text, '') = ?", "m.date >= ?"]
-                params: list[Any] = [text, start_apple]
+                where = ["m.is_from_me = 1", "COALESCE(m.text, '') = ?", "m.date >= ?", "m.ROWID > ?"]
+                params: list[Any] = [text, start_apple, min_rowid]
                 if chat_id is not None:
                     where.append("cmj.chat_id = ?")
                     params.append(chat_id)
+                else:
+                    identity_sql, identity_params = self._sent_message_identity_sql(
+                        schema,
+                        chat_identifier=chat_identifier,
+                        chat_guid=chat_guid,
+                        recipient=recipient,
+                    )
+                    if identity_sql:
+                        where.append(identity_sql)
+                        params.extend(identity_params)
                 row = conn.execute(
                     f"""
                     SELECT {select}
@@ -1029,6 +1060,55 @@ end run
                     return self._rows_to_messages(conn, [row], include_attachments=False)[0]
             time.sleep(0.1)
         return None
+
+    def _sent_message_identity_sql(
+        self,
+        schema: _Schema,
+        chat_identifier: str | None,
+        chat_guid: str | None,
+        recipient: str | None,
+    ) -> tuple[str, list[Any]]:
+        values: list[str] = []
+        if chat_guid:
+            values.append(chat_guid)
+        if chat_identifier:
+            values.append(chat_identifier)
+        if recipient:
+            values.append(recipient)
+        candidates = sorted(self._handle_candidates(values))
+        if not candidates:
+            return "", []
+
+        placeholders = ", ".join("?" for _ in candidates)
+        clauses = []
+        if chat_guid:
+            clauses.append(f"c.guid IN ({placeholders})")
+        if chat_identifier or recipient:
+            clauses.append(f"c.chat_identifier IN ({placeholders})")
+            if "last_addressed_handle" in schema.chat:
+                clauses.append(f"c.last_addressed_handle IN ({placeholders})")
+            clauses.append(f"h.id IN ({placeholders})")
+            if "uncanonicalized_id" in schema.handle:
+                clauses.append(f"h.uncanonicalized_id IN ({placeholders})")
+
+        params: list[Any] = []
+        for _ in clauses:
+            params.extend(candidates)
+        return f"({' OR '.join(clauses)})", params
+
+    def _handle_candidates(self, values: list[str]) -> set[str]:
+        candidates = set()
+        for raw in values:
+            value = str(raw or "").strip()
+            if not value:
+                continue
+            candidates.add(value)
+            normalized = self._normalize_handle(value)
+            if normalized:
+                candidates.add(normalized)
+                for prefix in ("iMessage;-;", "iMessage;+;", "SMS;-;", "SMS;+;", "any;-;", "any;+;"):
+                    candidates.add(prefix + normalized)
+        return candidates
 
     def _raise_if_ghost_row(self, chat_identifier: str | None, chat_guid: str | None, sent_at: datetime) -> None:
         handles = [value for value in (chat_identifier, chat_guid) if value]
