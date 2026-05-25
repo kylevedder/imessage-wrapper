@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,19 +8,42 @@ version = "0.1.0"
 description = "Sync-first Python API for local macOS Messages and Contacts"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{name = "imessage-wrapper contributors"}]
+keywords = ["imessage", "messages", "macos", "contacts", "sms"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Typing :: Typed",
+]
 dependencies = [
     "phonenumbers>=8.13",
 ]
+
+[project.urls]
+Homepage = "https://github.com/kylevedder/imessage-wrapper"
+Repository = "https://github.com/kylevedder/imessage-wrapper"
+Issues = "https://github.com/kylevedder/imessage-wrapper/issues"
+Source = "https://github.com/kylevedder/imessage-wrapper"
 
 [project.optional-dependencies]
 contacts = [
     "pyobjc-framework-Contacts>=10.0; sys_platform == 'darwin'",
 ]
 dev = [
+    "build>=1.2",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "twine>=5.0",
 ]
 
 [tool.setuptools]
@@ -28,6 +51,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+imessage_wrapper = ["py.typed"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

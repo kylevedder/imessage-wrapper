@@ -4,6 +4,20 @@
 Messages history, enriching it with macOS Contacts, sending through Messages.app,
 and creating/updating Contacts records through Apple's Contacts framework.
 
+## Install
+
+```bash
+pip install imessage-wrapper
+```
+
+Install the optional Contacts write dependency on macOS with:
+
+```bash
+pip install "imessage-wrapper[contacts]"
+```
+
+## Usage
+
 ```python
 from imessage_wrapper import IMessageClient
 
