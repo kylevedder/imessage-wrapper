@@ -195,6 +195,43 @@ def test_client_search_chats_matches_accent_normalized_name(tmp_path):
     assert [chat.display_name for chat in chats] == ["Émile Example"]
 
 
+def test_client_search_chats_scores_beyond_requested_limit(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    conn = sqlite3.connect(messages_db)
+    try:
+        older = apple_ns(datetime(2026, 5, 1, 12, tzinfo=timezone.utc))
+        newer = apple_ns(datetime(2026, 5, 2, 12, tzinfo=timezone.utc))
+        conn.execute("UPDATE chat SET display_name = 'Alex' WHERE ROWID = 1")
+        conn.execute("UPDATE message SET date = ? WHERE ROWID = 1", (older,))
+        conn.execute("INSERT INTO handle VALUES (2, '+15550100002', 'iMessage', '+1 (555) 010-0002')")
+        conn.execute(
+            """
+            INSERT INTO chat
+            VALUES (2, 'iMessage;-;+15550100002', '+15550100002', 'Alexandria Project', 'iMessage',
+                    'iMessage;+;me@example.test', 'me@example.test', '+15550100002')
+            """
+        )
+        conn.execute("INSERT INTO chat_handle_join VALUES (2, 2)")
+        conn.execute(
+            """
+            INSERT INTO message
+            VALUES (2, 'msg-2', 'newer partial match', NULL, NULL, 2, 'iMessage', ?, NULL, NULL,
+                    0, 1, NULL, NULL, NULL, NULL, NULL)
+            """,
+            (newer,),
+        )
+        conn.execute("INSERT INTO chat_message_join VALUES (2, 2)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[])
+    chats = client.search_chats("alex", limit=1)
+
+    assert [chat.display_name for chat in chats] == ["Alex"]
+
+
 def test_client_enrichment_prefers_specific_contact_over_aggregate_record(tmp_path):
     messages_db = tmp_path / "chat.db"
     contacts_db = tmp_path / "AddressBook-v22.abcddb"
