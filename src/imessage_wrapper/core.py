@@ -498,7 +498,6 @@ class LiveIMessageReader(IMessageReader):
                     compact_like,
                     compact_like,
                 ))
-            candidate_limit = max(limit * 10, 50)
             rows = conn.execute(
                 """
                 SELECT
@@ -521,9 +520,8 @@ class LiveIMessageReader(IMessageReader):
                   )
                 GROUP BY user_id, display_name, handle_id, uncanonicalized_handle, resolved_service
                 ORDER BY MAX(m.date) DESC
-                LIMIT ?
                 """,
-                (*params, candidate_limit),
+                params,
             ).fetchall()
         finally:
             conn.close()
@@ -1072,7 +1070,6 @@ class LiveContactsReader(ContactsReader):
                         compact_like,
                         like,
                     ))
-                candidate_limit = max(limit * 10, 50)
                 entity_where = self._record_entity_where_sql(conn)
                 search_where = "WHERE " + (entity_where.removeprefix("WHERE ") + " AND (" if entity_where else "(")
                 rows = conn.execute(
@@ -1086,9 +1083,8 @@ class LiveContactsReader(ContactsReader):
                     ORDER BY
                         lower(COALESCE(r.ZSORTINGLASTNAME, r.ZLASTNAME, '')),
                         lower(COALESCE(r.ZSORTINGFIRSTNAME, r.ZFIRSTNAME, ''))
-                    LIMIT ?
                     """,
-                    (*params, candidate_limit),
+                    params,
                 ).fetchall()
                 for row in rows:
                     contact = self._record_to_contact(conn, row, db_path)

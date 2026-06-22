@@ -157,7 +157,6 @@ class IMessageClient:
             routing = self._chat_routing_sql(schema)
             clauses: list[str] = []
             params: list[Any] = []
-            candidate_limit = max(limit * 10, 50)
             for term in terms:
                 like = f"%{term}%"
                 compact = f"%{core._compact_lookup_text(term)}%"
@@ -200,9 +199,8 @@ class IMessageClient:
                 FROM chat c
                 WHERE {" OR ".join(f"({clause})" for clause in clauses)}
                 ORDER BY last_message_date DESC
-                LIMIT ?
                 """,
-                (*params, candidate_limit),
+                params,
             ).fetchall()
             chats = [self._row_to_chat(conn, row) for row in rows]
         scored = []
