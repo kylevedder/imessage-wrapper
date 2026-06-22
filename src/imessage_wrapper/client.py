@@ -601,7 +601,7 @@ class IMessageClient:
             {col("guid")} AS guid,
             m.handle_id AS handle_rowid,
             h.id AS sender,
-            COALESCE(m.text, m.subject, '') AS text,
+            COALESCE(NULLIF(m.text, ''), {col("subject")}, '') AS text,
             {col("attributedBody")} AS attributed_body,
             m.date AS message_date,
             m.is_from_me AS is_from_me,
