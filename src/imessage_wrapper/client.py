@@ -342,25 +342,34 @@ class IMessageClient:
             raise ValueError("query is required")
         if match not in {"contains", "exact"}:
             raise ValueError("match must be 'contains' or 'exact'")
-        operator = "=" if match == "exact" else "LIKE"
-        value = needle if match == "exact" else f"%{needle}%"
         with self._connect_messages() as conn:
             schema = self._schema(conn)
             select = self._message_select(schema)
-            rows = conn.execute(
-                f"""
-                SELECT {select}
-                FROM message m
-                LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-                LEFT JOIN handle h ON h.ROWID = m.handle_id
-                LEFT JOIN chat c ON c.ROWID = cmj.chat_id
-                WHERE COALESCE(m.text, '') {operator} ?
-                  AND ({self._non_reaction_filter(schema)})
-                ORDER BY m.date DESC, m.ROWID DESC
-                LIMIT ?
-                """,
-                (value, limit),
-            ).fetchall()
+            rows: list[sqlite3.Row] = []
+            page_size = max(limit * 10, 100)
+            offset = 0
+            while len(rows) < limit:
+                page = conn.execute(
+                    f"""
+                    SELECT {select}
+                    FROM message m
+                    LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+                    LEFT JOIN handle h ON h.ROWID = m.handle_id
+                    LEFT JOIN chat c ON c.ROWID = cmj.chat_id
+                    WHERE ({self._non_reaction_filter(schema)})
+                    ORDER BY m.date DESC, m.ROWID DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (page_size, offset),
+                ).fetchall()
+                if not page:
+                    break
+                for row in page:
+                    if self._message_text_matches(row, needle, match):
+                        rows.append(row)
+                        if len(rows) >= limit:
+                            break
+                offset += len(page)
             return self._rows_to_messages(conn, list(reversed(rows)), include_attachments=False)
 
     def contacts(self, limit: int = 5000, offset: int = 0) -> list[Contact]:
@@ -682,6 +691,12 @@ class IMessageClient:
                 )
             )
         return messages
+
+    def _message_text_matches(self, row: sqlite3.Row, needle: str, match: str) -> bool:
+        text = row["text"] or core._extract_attributed_body_text(row["attributed_body"]) or ""
+        if match == "exact":
+            return text == needle
+        return needle.casefold() in text.casefold()
 
     def _participants(self, conn: sqlite3.Connection, chat_id: int) -> list[str]:
         try:
