@@ -133,6 +133,61 @@ def test_live_imessage_reader_searches_contacts_by_name(tmp_path):
     assert result["contacts"][0]["display_name"] == "Alex"
 
 
+def test_live_imessage_reader_searches_contacts_with_accent_normalized_name(tmp_path):
+    db_path = tmp_path / "chat.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE message (
+                ROWID INTEGER PRIMARY KEY,
+                guid TEXT,
+                text TEXT,
+                handle_id INTEGER,
+                service TEXT,
+                date INTEGER
+            );
+            CREATE TABLE handle (
+                ROWID INTEGER PRIMARY KEY,
+                id TEXT,
+                service TEXT,
+                uncanonicalized_id TEXT
+            );
+            CREATE TABLE chat (
+                ROWID INTEGER PRIMARY KEY,
+                guid TEXT,
+                chat_identifier TEXT,
+                display_name TEXT,
+                service_name TEXT
+            );
+            CREATE TABLE chat_message_join (
+                chat_id INTEGER,
+                message_id INTEGER
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO handle (ROWID, id, service, uncanonicalized_id) VALUES (1, '+15550100003', 'iMessage', '+1 (555) 010-0003')"
+        )
+        conn.execute(
+            """
+            INSERT INTO chat (ROWID, guid, chat_identifier, display_name, service_name)
+            VALUES (1, '+15550100003', '+15550100003', 'Émile Example', 'iMessage')
+            """
+        )
+        conn.execute(
+            "INSERT INTO message (ROWID, guid, text, handle_id, service, date) VALUES (1, 'msg-1', 'hello', 1, 'iMessage', 794990122746508544)"
+        )
+        conn.execute("INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 1)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = LiveIMessageReader(db_path)._search_contacts_sync("emile", limit=10)
+
+    assert result["contacts"][0]["display_name"] == "Émile Example"
+
+
 def test_live_imessage_reader_searches_contacts_with_tokenized_punctuation(tmp_path):
     db_path = tmp_path / "chat.db"
     conn = sqlite3.connect(db_path)
@@ -700,9 +755,11 @@ def test_live_contacts_reader_matches_accented_and_apostrophe_names(tmp_path):
     finally:
         conn.close()
 
+    by_single_token = LiveContactsReader([db_path])._search_contacts_sync("emile", limit=10)
     by_accentless = LiveContactsReader([db_path])._search_contacts_sync("emile example", limit=10)
     by_slash = LiveContactsReader([db_path])._search_contacts_sync("slash example", limit=10)
 
+    assert by_single_token["contacts"][0]["display_name"] == "Émile Example"
     assert by_accentless["contacts"][0]["display_name"] == "Émile Example"
     assert by_slash["contacts"][0]["display_name"] == "Slash Example"
 

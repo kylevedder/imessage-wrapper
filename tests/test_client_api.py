@@ -179,6 +179,22 @@ def test_client_lists_chats_and_enriches_contacts(tmp_path):
     assert chats[0].participants == ["+15550100001"]
 
 
+def test_client_search_chats_matches_accent_normalized_name(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    conn = sqlite3.connect(messages_db)
+    try:
+        conn.execute("UPDATE chat SET display_name = 'Émile Example' WHERE ROWID = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[])
+    chats = client.search_chats("emile")
+
+    assert [chat.display_name for chat in chats] == ["Émile Example"]
+
+
 def test_client_enrichment_prefers_specific_contact_over_aggregate_record(tmp_path):
     messages_db = tmp_path / "chat.db"
     contacts_db = tmp_path / "AddressBook-v22.abcddb"
