@@ -37,3 +37,32 @@ jobs:
 
       - name: Run tests
         run: uv run --frozen --python ${{ matrix.python-version }} --extra dev pytest -q
+
+  package:
+    name: Build and install package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: "0.8.12"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Test wheel install
+        run: |
+          test_dir="$(mktemp -d)"
+          cp -R tests "$test_dir/tests"
+          cd "$test_dir"
+          uv venv --python 3.13
+          uv pip install pytest pytest-asyncio "$GITHUB_WORKSPACE"/dist/*.whl
+          .venv/bin/python -m pytest -q tests
