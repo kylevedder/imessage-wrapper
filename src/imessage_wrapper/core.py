@@ -993,8 +993,7 @@ class LiveContactsReader(ContactsReader):
         search_terms = _query_lookup_terms(query)
         if not search_terms:
             raise ValueError("query is required")
-        contacts = []
-        seen_keys: set[tuple[str | None, str | None, str | None, str | None]] = set()
+        contacts_by_key: dict[tuple[str | None, str | None, str | None, str | None], tuple[int, dict[str, Any]]] = {}
         searched_paths: list[str] = []
         for db_path in self.db_paths:
             conn = self._connect(db_path)
@@ -1096,8 +1095,6 @@ class LiveContactsReader(ContactsReader):
                         emails[0]["value"] if emails else None,
                         f"{db_path}:{row['record_id']}" if not phones and not emails else None,
                     )
-                    if dedupe_key in seen_keys:
-                        continue
                     score = _lookup_match_score(
                         query,
                         [
@@ -1113,10 +1110,12 @@ class LiveContactsReader(ContactsReader):
                     )
                     if score is None:
                         continue
-                    seen_keys.add(dedupe_key)
-                    contacts.append((score, contact))
+                    existing = contacts_by_key.get(dedupe_key)
+                    if existing is None or score > existing[0]:
+                        contacts_by_key[dedupe_key] = (score, contact)
             finally:
                 conn.close()
+        contacts = list(contacts_by_key.values())
         contacts.sort(
             key=lambda item: (
                 -item[0],
