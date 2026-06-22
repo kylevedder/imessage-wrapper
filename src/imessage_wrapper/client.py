@@ -165,18 +165,26 @@ class IMessageClient:
                     lower(COALESCE(c.display_name, '')) LIKE ?
                     OR lower(COALESCE(c.chat_identifier, '')) LIKE ?
                     OR lower(COALESCE(c.guid, '')) LIKE ?
+                    OR imessage_lookup_normalize(c.display_name) LIKE ?
+                    OR imessage_lookup_compact(c.display_name) LIKE ?
+                    OR imessage_lookup_normalize(c.chat_identifier) LIKE ?
+                    OR imessage_lookup_compact(c.chat_identifier) LIKE ?
+                    OR imessage_lookup_normalize(c.guid) LIKE ?
+                    OR imessage_lookup_compact(c.guid) LIKE ?
                     OR EXISTS (
                         SELECT 1 FROM chat_handle_join chj
                         JOIN handle h ON h.ROWID = chj.handle_id
                         WHERE chj.chat_id = c.ROWID
                           AND (
                               lower(COALESCE(h.id, '')) LIKE ?
+                              OR imessage_lookup_normalize(h.id) LIKE ?
                               OR replace(replace(replace(replace(replace(lower(COALESCE(h.id, '')), '+', ''), ' ', ''), '-', ''), '(', ''), ')', '') LIKE ?
+                              OR imessage_lookup_compact(h.id) LIKE ?
                           )
                     )
                     """
                 )
-                params.extend([like, like, like, like, compact])
+                params.extend([like, like, like, like, compact, like, compact, like, compact, like, like, compact, compact])
             rows = conn.execute(
                 f"""
                 SELECT
@@ -553,6 +561,7 @@ class IMessageClient:
             raise core.IMessageError(f"Messages database not found at {self.messages_db_path}")
         conn = sqlite3.connect(f"file:{self.messages_db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
+        core._register_lookup_functions(conn)
         return conn
 
     def _schema(self, conn: sqlite3.Connection) -> _Schema:
