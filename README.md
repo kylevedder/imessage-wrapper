@@ -16,6 +16,23 @@ Install the optional Contacts write dependency on macOS with:
 pip install "imessage-wrapper[contacts]"
 ```
 
+## Development
+
+This repository uses `uv` for reproducible local environments. The committed
+`uv.lock` captures dependency resolution; the generated `.venv/` stays local
+and is ignored by git.
+
+```bash
+uv sync --all-extras
+uv run pytest
+```
+
+After changing dependencies in `pyproject.toml`, refresh the lockfile with:
+
+```bash
+uv lock
+```
+
 ## Usage
 
 ```python
