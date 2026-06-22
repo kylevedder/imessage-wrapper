@@ -232,6 +232,46 @@ def test_client_search_chats_scores_beyond_requested_limit(tmp_path):
     assert [chat.display_name for chat in chats] == ["Alex"]
 
 
+def test_client_search_chats_scores_all_prefiltered_candidates(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    conn = sqlite3.connect(messages_db)
+    try:
+        old = apple_ns(datetime(2026, 5, 1, 12, tzinfo=timezone.utc))
+        conn.execute("UPDATE chat SET display_name = 'Alex Exact' WHERE ROWID = 1")
+        conn.execute("UPDATE message SET date = ? WHERE ROWID = 1", (old,))
+        for index in range(2, 53):
+            ts = apple_ns(datetime(2026, 5, 2, 12, index % 60, tzinfo=timezone.utc))
+            phone = f"+1555010{index:04d}"
+            conn.execute("INSERT INTO handle VALUES (?, ?, 'iMessage', ?)", (index, phone, phone))
+            conn.execute(
+                """
+                INSERT INTO chat
+                VALUES (?, ?, ?, ?, 'iMessage',
+                        'iMessage;+;me@example.test', 'me@example.test', ?)
+                """,
+                (index, f"iMessage;-;{phone}", phone, f"Alex Exact Project {index:02d}", phone),
+            )
+            conn.execute("INSERT INTO chat_handle_join VALUES (?, ?)", (index, index))
+            conn.execute(
+                """
+                INSERT INTO message
+                VALUES (?, ?, 'newer partial match', NULL, NULL, ?, 'iMessage', ?, NULL, NULL,
+                        0, 1, NULL, NULL, NULL, NULL, NULL)
+                """,
+                (index, f"msg-{index}", index, ts),
+            )
+            conn.execute("INSERT INTO chat_message_join VALUES (?, ?)", (index, index))
+        conn.commit()
+    finally:
+        conn.close()
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[])
+    chats = client.search_chats("alex exact", limit=1)
+
+    assert [chat.display_name for chat in chats] == ["Alex Exact"]
+
+
 def test_client_enrichment_prefers_specific_contact_over_aggregate_record(tmp_path):
     messages_db = tmp_path / "chat.db"
     contacts_db = tmp_path / "AddressBook-v22.abcddb"
