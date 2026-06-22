@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import sqlite3
 import subprocess
 import time
@@ -8,6 +9,7 @@ from typing import Any
 
 import pytest
 
+import imessage_wrapper.core as core
 from imessage_wrapper.core import (
     APPLE_EPOCH,
     AppleScriptIMessageSender,
@@ -17,6 +19,7 @@ from imessage_wrapper.core import (
     LiveIMessageReader,
     _attributed_body_contains_text,
     _extract_attributed_body_text,
+    _extract_attributed_body_text_heuristic,
     _looks_like_group_chat_guid,
     _looks_like_group_chat_identifier,
     _normalize_message_text,
@@ -749,7 +752,80 @@ def test_live_contacts_reader_rejects_punctuation_only_query(tmp_path):
         LiveContactsReader([db_path])._search_contacts_sync("((()))!!!", limit=10)
 
 
-def test_extract_attributed_body_text_recovers_message_text():
+_ATTRIBUTED_BODY_FIXTURES = [
+    (
+        "BAtzdHJlYW10eXBlZIHoA4QBQISEhBJOU0F0dHJpYnV0ZWRTdHJpbmcAhIQITlNPYmplY3QAhZKEhIQITlNTdHJpbmcBlIQBKydJ4oCZbGwgYnJpbmcgdGhlIHNhbXBsZSBwYWNrYWdlIHRvbmlnaHSGhAJpSQElkoSEhAxOU0RpY3Rpb25hcnkAlIQBaQCGhg==",
+        "I’ll bring the sample package tonight",
+    ),
+    (
+        "BAtzdHJlYW10eXBlZIHoA4QBQISEhBJOU0F0dHJpYnV0ZWRTdHJpbmcAhIQITlNPYmplY3QAhZKEhIQITlNTdHJpbmcBlIQBKyFodHRwczovL2V4YW1wbGUudGVzdC9yZXNlYXJjaC1raXSGhAJpSQEhkoSEhAxOU0RpY3Rpb25hcnkAlIQBaQCGhg==",
+        "https://example.test/research-kit",
+    ),
+    (
+        "BAtzdHJlYW10eXBlZIHoA4QBQISEhBJOU0F0dHJpYnV0ZWRTdHJpbmcAhIQITlNPYmplY3QAhZKEhIQITlNTdHJpbmcBlIQBK09MaWtlZCDigJxMZXQgbWUgc2VlIGlmIEkgY2FuIHJlZmVyIHlvdSB0byBhdCBsZWFzdCBvbmUgb2YgdGhlIGhhcmR3YXJlIGZvbGtz4oCdhoQCaUkBS5KEhIQMTlNEaWN0aW9uYXJ5AJSEAWkAhoY=",
+        "Liked “Let me see if I can refer you to at least one of the hardware folks”",
+    ),
+    (
+        "BAtzdHJlYW10eXBlZIHoA4QBQISEhBJOU0F0dHJpYnV0ZWRTdHJpbmcAhIQITlNPYmplY3QAhZKEhIQITlNTdHJpbmcBlIQBKx1SZWFjdGVkIPCfmIIgdG8g4oCcU2hpcCBpdOKAnYaEAmlJAReShISEDE5TRGljdGlvbmFyeQCUhAFpAIaG",
+        "Reacted 😂 to “Ship it”",
+    ),
+]
+
+
+def test_extract_attributed_body_text_uses_foundation_decoder_for_streamtyped_payloads(monkeypatch):
+    expected_by_blob = {base64.b64decode(encoded): expected for encoded, expected in _ATTRIBUTED_BODY_FIXTURES}
+
+    def fake_foundation_decode(value):
+        return expected_by_blob[value]
+
+    monkeypatch.setattr(core, "_decode_attributed_body_text_with_foundation", fake_foundation_decode)
+
+    for blob, expected in expected_by_blob.items():
+        assert blob.startswith(b"\x04\x0bstreamtyped")
+        assert _extract_attributed_body_text(blob) == expected
+
+
+def test_extract_attributed_body_text_decodes_streamtyped_fixture_with_real_foundation():
+    try:
+        symbols = core._foundation_attributed_body_symbols()
+    except core.IMessageError as exc:
+        pytest.skip(str(exc))
+    if symbols is None:
+        pytest.skip("Foundation is not available on this platform")
+
+    for encoded, expected in _ATTRIBUTED_BODY_FIXTURES:
+        assert _extract_attributed_body_text(base64.b64decode(encoded)) == expected
+
+
+def test_decode_attributed_body_text_with_foundation_adapter(monkeypatch):
+    class FakeData:
+        @classmethod
+        def dataWithBytes_length_(cls, value, length):
+            return value[:length]
+
+    class FakeAttributedString:
+        def string(self):
+            return "Cafe\u0301"
+
+    class FakeUnarchiver:
+        @classmethod
+        def unarchiveObjectWithData_(cls, data):
+            assert data == b"payload"
+            return FakeAttributedString()
+
+    monkeypatch.setattr(core, "_foundation_attributed_body_symbols", lambda: (FakeData, FakeUnarchiver))
+
+    assert core._decode_attributed_body_text_with_foundation(b"payload") == "Café"
+
+
+def test_extract_attributed_body_text_falls_back_when_foundation_returns_none(monkeypatch):
+    monkeypatch.setattr(core, "_decode_attributed_body_text_with_foundation", lambda value: None)
+    payload = b"NSString\x01fallback text\x00NSDictionary"
+
+    assert _extract_attributed_body_text(payload) == "fallback text"
+
+
+def test_extract_attributed_body_text_heuristic_recovers_message_text():
     payload = (
         b"\x04\x0bstreamtyped"
         b"NSAttributedString\x00NSObject\x00NSString\x01"
@@ -757,10 +833,10 @@ def test_extract_attributed_body_text_recovers_message_text():
         b"NSDictionary\x00__kIMMessagePartAttributeName"
     )
 
-    assert _extract_attributed_body_text(payload) == "Please bring the sample package today"
+    assert _extract_attributed_body_text_heuristic(payload) == "Please bring the sample package today"
 
 
-def test_extract_attributed_body_text_ignores_keyed_archive_metadata():
+def test_extract_attributed_body_text_heuristic_ignores_keyed_archive_metadata():
     payload = (
         b"\x04\x0bstreamtyped"
         b"\x00NSMutableAttributedString\x00"
@@ -780,19 +856,19 @@ def test_extract_attributed_body_text_ignores_keyed_archive_metadata():
         b"DDScannerResult\x00"
     )
 
-    assert _extract_attributed_body_text(payload) == "Archive metadata should not hide this message"
+    assert _extract_attributed_body_text_heuristic(payload) == "Archive metadata should not hide this message"
 
 
-def test_extract_attributed_body_text_recovers_unicode_message_text():
+def test_extract_attributed_body_text_heuristic_recovers_unicode_message_text():
     payload = "NSString\x01こんにちは\x00NSDictionary".encode()
 
-    assert _extract_attributed_body_text(payload) == "こんにちは"
+    assert _extract_attributed_body_text_heuristic(payload) == "こんにちは"
 
 
-def test_extract_attributed_body_text_recovers_emoji_only_message_text():
+def test_extract_attributed_body_text_heuristic_recovers_emoji_only_message_text():
     payload = "NSString\x01🙂🙂\x00NSDictionary".encode()
 
-    assert _extract_attributed_body_text(payload) == "🙂🙂"
+    assert _extract_attributed_body_text_heuristic(payload) == "🙂🙂"
 
 
 def test_group_chat_identifier_helpers_detect_group_targets():
@@ -812,8 +888,10 @@ def test_normalize_message_text_normalizes_unicode():
     assert _normalize_message_text("Cafe\u0301") == _normalize_message_text("Caf\u00e9")
 
 
-def test_attributed_body_contains_multiline_text():
+def test_attributed_body_contains_multiline_text(monkeypatch):
     payload = b"\x00NSString\x01\x00first fixture line\nsecond fixture line\x00NSDictionary"
+    monkeypatch.setattr(core, "_decode_attributed_body_text_with_foundation", lambda value: "first fixture line\nsecond fixture line")
+
     assert _attributed_body_contains_text(payload, "first fixture line\nsecond fixture line") is True
 
 
@@ -1021,6 +1099,7 @@ def test_applescript_sender_verifies_group_send_from_attributed_body_multiline(t
 
     sent_message = "first fixture line\nsecond fixture line"
     payload = b"\x00NSString\x01\x00first fixture line\nsecond fixture line\x00NSDictionary"
+    monkeypatch.setattr(core, "_decode_attributed_body_text_with_foundation", lambda value: sent_message)
 
     def fake_run(cmd, input, text, capture_output, timeout, check, env):
         write_conn = sqlite3.connect(db_path)

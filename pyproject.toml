@@ -27,6 +27,7 @@ classifiers = [
 ]
 dependencies = [
     "phonenumbers>=8.13",
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.urls]

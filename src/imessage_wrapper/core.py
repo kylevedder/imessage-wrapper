@@ -10,6 +10,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -117,6 +118,7 @@ _ATTRIBUTED_BODY_EXCLUDED_SUBSTRINGS = (
 )
 
 _GROUP_CHAT_IDENTIFIER_RE = re.compile(r"^[0-9a-f]{20,}$", re.IGNORECASE)
+_FOUNDATION_ATTRIBUTED_BODY_SYMBOLS: tuple[Any, Any] | None | bool = False
 
 
 def _normalize_lookup_text(value: Any) -> str:
@@ -193,7 +195,49 @@ def _lookup_match_score(query: str, values: list[Any]) -> int | None:
     return score
 
 
-def _extract_attributed_body_text(value: bytes | None) -> str:
+def _foundation_attributed_body_symbols() -> tuple[Any, Any] | None:
+    global _FOUNDATION_ATTRIBUTED_BODY_SYMBOLS
+    if _FOUNDATION_ATTRIBUTED_BODY_SYMBOLS is not False:
+        return _FOUNDATION_ATTRIBUTED_BODY_SYMBOLS
+    try:
+        from Foundation import NSData, NSUnarchiver
+    except ImportError as exc:
+        if sys.platform == "darwin":
+            raise IMessageError(
+                "Decoding iMessage attributedBody requires PyObjC Cocoa on macOS. "
+                "Install with `pip install pyobjc-framework-Cocoa`."
+            ) from exc
+        _FOUNDATION_ATTRIBUTED_BODY_SYMBOLS = None
+        return None
+    _FOUNDATION_ATTRIBUTED_BODY_SYMBOLS = (NSData, NSUnarchiver)
+    return _FOUNDATION_ATTRIBUTED_BODY_SYMBOLS
+
+
+def _decode_attributed_body_text_with_foundation(value: bytes) -> str | None:
+    symbols = _foundation_attributed_body_symbols()
+    if symbols is None:
+        return None
+    NSData, NSUnarchiver = symbols
+    try:
+        data = NSData.dataWithBytes_length_(value, len(value))
+        decoded = NSUnarchiver.unarchiveObjectWithData_(data)
+    except Exception:
+        log.debug("Foundation failed to decode iMessage attributedBody", exc_info=True)
+        return None
+    if decoded is None:
+        return None
+
+    attr_string = getattr(decoded, "string", None)
+    if attr_string is not None:
+        text = attr_string() if callable(attr_string) else attr_string
+    elif isinstance(decoded, str):
+        text = decoded
+    else:
+        return None
+    return unicodedata.normalize("NFC", str(text))
+
+
+def _extract_attributed_body_text_heuristic(value: bytes | None) -> str:
     if not value:
         return ""
     decoded = unicodedata.normalize("NFC", value.decode("utf-8", "ignore"))
@@ -220,6 +264,15 @@ def _extract_attributed_body_text(value: bytes | None) -> str:
             continue
         return text
     return ""
+
+
+def _extract_attributed_body_text(value: bytes | None) -> str:
+    if not value:
+        return ""
+    decoded = _decode_attributed_body_text_with_foundation(value)
+    if decoded is not None:
+        return decoded
+    return _extract_attributed_body_text_heuristic(value)
 
 
 def _display_contact_name(row: sqlite3.Row | dict[str, Any]) -> str:
@@ -1825,7 +1878,7 @@ def _attributed_body_contains_text(value: bytes | None, expected_text: str) -> b
     expected = _normalize_message_text(expected_text)
     if not expected:
         return False
-    decoded = unicodedata.normalize("NFC", value.decode("utf-8", "ignore"))
+    decoded = _normalize_message_text(_extract_attributed_body_text(value))
     return expected in decoded
 
 

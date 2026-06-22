@@ -5,6 +5,7 @@ import subprocess
 from datetime import datetime, timezone
 
 from imessage_wrapper import IMessageClient
+import imessage_wrapper.core as core
 from imessage_wrapper.contacts_writer import ContactUpdatePayload, ContactsWriter
 from imessage_wrapper.core import APPLE_EPOCH
 
@@ -281,6 +282,23 @@ def test_client_reads_messages_and_contacts_with_timestamps(tmp_path):
     assert messages[0].chat_identifier == "+15550100001"
     assert contacts[0].created_at.year == 2026
     assert contacts[0].modified_at.day == 2
+
+
+def test_client_reads_attributed_body_when_text_column_is_empty(tmp_path, monkeypatch):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    conn = sqlite3.connect(messages_db)
+    try:
+        conn.execute("UPDATE message SET text = NULL, attributedBody = ? WHERE ROWID = 1", (b"streamtyped fixture",))
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(core, "_decode_attributed_body_text_with_foundation", lambda value: "clean attributed body")
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[])
+    messages = client.messages(chat_id=1, limit=10)
+
+    assert messages[0].text == "clean attributed body"
 
 
 def test_client_send_dry_run_uses_chat_id_target(tmp_path):
