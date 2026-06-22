@@ -993,8 +993,29 @@ class LiveContactsReader(ContactsReader):
         search_terms = _query_lookup_terms(query)
         if not search_terms:
             raise ValueError("query is required")
-        contacts_by_key: dict[tuple[str | None, str | None, str | None, str | None], tuple[int, dict[str, Any]]] = {}
+        contacts_by_key: dict[tuple[str, str, str, str | None, str], tuple[int, dict[str, Any]]] = {}
         searched_paths: list[str] = []
+
+        def primary_value(items: list[dict[str, Any]] | None) -> str | None:
+            values = list(items or [])
+            if not values:
+                return None
+            primary = next((item for item in values if item.get("is_primary")), None)
+            selected = primary or values[0]
+            value = str(selected.get("value") or "").strip()
+            return value or None
+
+        def dedupe_key(contact: dict[str, Any]) -> tuple[str, str, str, str | None, str]:
+            phone = "".join(ch for ch in str(primary_value(contact.get("phone_numbers")) or "") if ch.isdigit())
+            email = str(primary_value(contact.get("email_addresses")) or "").strip().lower()
+            display_name = _normalize_lookup_text(
+                contact.get("display_name") or contact.get("first_name") or contact.get("organization")
+            )
+            fallback = ""
+            if not phone and not email:
+                fallback = f"{contact.get('source_db_path') or ''}:{contact.get('record_id') or ''}"
+            return (display_name, phone, email, contact.get("organization"), fallback)
+
         for db_path in self.db_paths:
             conn = self._connect(db_path)
             try:
@@ -1089,12 +1110,7 @@ class LiveContactsReader(ContactsReader):
                     contact = self._record_to_contact(conn, row, db_path)
                     phones = contact["phone_numbers"]
                     emails = contact["email_addresses"]
-                    dedupe_key = (
-                        row["ZNAME"],
-                        phones[0]["value"] if phones else None,
-                        emails[0]["value"] if emails else None,
-                        f"{db_path}:{row['record_id']}" if not phones and not emails else None,
-                    )
+                    key = dedupe_key(contact)
                     score = _lookup_match_score(
                         query,
                         [
@@ -1110,9 +1126,9 @@ class LiveContactsReader(ContactsReader):
                     )
                     if score is None:
                         continue
-                    existing = contacts_by_key.get(dedupe_key)
+                    existing = contacts_by_key.get(key)
                     if existing is None or score > existing[0]:
-                        contacts_by_key[dedupe_key] = (score, contact)
+                        contacts_by_key[key] = (score, contact)
             finally:
                 conn.close()
         contacts = list(contacts_by_key.values())
