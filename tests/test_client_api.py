@@ -431,6 +431,22 @@ def test_client_search_messages_finds_attributed_body_text(tmp_path, monkeypatch
     assert [message.text for message in messages] == ["clean attributed body"]
 
 
+def test_client_reads_and_searches_subject_when_text_is_empty(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    conn = sqlite3.connect(messages_db)
+    try:
+        conn.execute("UPDATE message SET text = '', subject = 'subject only text' WHERE ROWID = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[])
+
+    assert [message.text for message in client.messages(chat_id=1)] == ["subject only text"]
+    assert [message.text for message in client.search_messages("subject only")] == ["subject only text"]
+
+
 def test_client_send_dry_run_uses_chat_id_target(tmp_path):
     messages_db = tmp_path / "chat.db"
     make_messages_db(messages_db)
