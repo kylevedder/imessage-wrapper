@@ -996,7 +996,7 @@ class LiveContactsReader(ContactsReader):
         if not search_terms:
             raise ValueError("query is required")
         contacts = []
-        seen_keys: set[tuple[str | None, str | None, str | None]] = set()
+        seen_keys: set[tuple[str | None, str | None, str | None, str | None]] = set()
         searched_paths: list[str] = []
         for db_path in self.db_paths:
             conn = self._connect(db_path)
@@ -1098,6 +1098,7 @@ class LiveContactsReader(ContactsReader):
                         row["ZNAME"],
                         phones[0]["value"] if phones else None,
                         emails[0]["value"] if emails else None,
+                        f"{db_path}:{row['record_id']}" if not phones and not emails else None,
                     )
                     if dedupe_key in seen_keys:
                         continue
