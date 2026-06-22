@@ -4,6 +4,8 @@ import sqlite3
 import subprocess
 from datetime import datetime, timezone
 
+import pytest
+
 from imessage_wrapper import IMessageClient
 import imessage_wrapper.core as core
 from imessage_wrapper.contacts_writer import ContactUpdatePayload, ContactsWriter
@@ -282,6 +284,24 @@ def test_client_reads_messages_and_contacts_with_timestamps(tmp_path):
     assert messages[0].chat_identifier == "+15550100001"
     assert contacts[0].created_at.year == 2026
     assert contacts[0].modified_at.day == 2
+
+
+def test_client_rejects_invalid_search_and_contact_bounds(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    contacts_db = tmp_path / "AddressBook-v22.abcddb"
+    make_messages_db(messages_db)
+    make_contacts_db(contacts_db)
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[contacts_db])
+
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        client.search_chats("alex", limit=0)
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        client.search_messages("hello", limit=0)
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        client.search_contacts("alex", limit=0)
+    with pytest.raises(ValueError, match="offset must be >= 0"):
+        client.contacts(offset=-1)
 
 
 def test_client_reads_attributed_body_when_text_column_is_empty(tmp_path, monkeypatch):
