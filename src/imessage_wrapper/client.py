@@ -144,6 +144,8 @@ class IMessageClient:
             return self._row_to_chat(conn, row) if row else None
 
     def search_chats(self, query: str, limit: int = 25) -> list[Chat]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
         needle = query.strip()
         if not needle:
             raise ValueError("query is required")
@@ -333,6 +335,8 @@ class IMessageClient:
                 kqueue.close()
 
     def search_messages(self, query: str, match: str = "contains", limit: int = 50) -> list[Message]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
         needle = query.strip()
         if not needle:
             raise ValueError("query is required")
@@ -362,6 +366,8 @@ class IMessageClient:
     def contacts(self, limit: int = 5000, offset: int = 0) -> list[Contact]:
         if limit < 1:
             raise ValueError("limit must be >= 1")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
         all_contacts = self._load_contacts()
         return all_contacts[offset:offset + limit]
 
@@ -375,6 +381,8 @@ class IMessageClient:
             offset += len(batch)
 
     def search_contacts(self, query: str, limit: int = 25) -> list[Contact]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
         needle = query.strip()
         if not needle:
             raise ValueError("query is required")
