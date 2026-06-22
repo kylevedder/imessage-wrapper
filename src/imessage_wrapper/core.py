@@ -145,6 +145,11 @@ def _query_lookup_terms(value: str) -> list[str]:
     return terms
 
 
+def _register_lookup_functions(conn: sqlite3.Connection) -> None:
+    conn.create_function("imessage_lookup_normalize", 1, _normalize_lookup_text)
+    conn.create_function("imessage_lookup_compact", 1, _compact_lookup_text)
+
+
 def _lookup_match_score(query: str, values: list[Any]) -> int | None:
     query_normalized = _normalize_lookup_text(query)
     query_compact = _compact_lookup_text(query)
@@ -383,6 +388,7 @@ class LiveIMessageReader(IMessageReader):
             raise IMessageError(f"Messages database not found at {self.db_path}")
         conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
+        _register_lookup_functions(conn)
         return conn
 
     def _list_users_sync(self, limit: int) -> dict[str, Any]:
@@ -456,14 +462,42 @@ class LiveIMessageReader(IMessageReader):
                         OR lower(COALESCE(h.uncanonicalized_id, '')) LIKE ?
                         OR lower(COALESCE(c.chat_identifier, '')) LIKE ?
                         OR lower(COALESCE(c.guid, '')) LIKE ?
+                        OR imessage_lookup_normalize(c.display_name) LIKE ?
+                        OR imessage_lookup_compact(c.display_name) LIKE ?
+                        OR imessage_lookup_normalize(h.id) LIKE ?
+                        OR imessage_lookup_compact(h.id) LIKE ?
+                        OR imessage_lookup_normalize(h.uncanonicalized_id) LIKE ?
+                        OR imessage_lookup_compact(h.uncanonicalized_id) LIKE ?
+                        OR imessage_lookup_normalize(c.chat_identifier) LIKE ?
+                        OR imessage_lookup_compact(c.chat_identifier) LIKE ?
+                        OR imessage_lookup_normalize(c.guid) LIKE ?
+                        OR imessage_lookup_compact(c.guid) LIKE ?
                         OR replace(replace(replace(replace(replace(lower(COALESCE(h.id, '')), '+', ''), ' ', ''), '-', ''), '(', ''), ')', '') LIKE ?
                         OR replace(replace(replace(replace(replace(lower(COALESCE(h.uncanonicalized_id, '')), '+', ''), ' ', ''), '-', ''), '(', ''), ')', '') LIKE ?
                         OR replace(replace(replace(replace(replace(lower(COALESCE(c.chat_identifier, '')), '+', ''), ' ', ''), '-', ''), '(', ''), ')', '') LIKE ?
                     )
                     """
                 )
-                params.extend((like, like, like, like, like, compact_like, compact_like, compact_like))
-            candidate_limit = max(limit * 10, 50)
+                params.extend((
+                    like,
+                    like,
+                    like,
+                    like,
+                    like,
+                    like,
+                    compact_like,
+                    like,
+                    compact_like,
+                    like,
+                    compact_like,
+                    like,
+                    compact_like,
+                    like,
+                    compact_like,
+                    compact_like,
+                    compact_like,
+                    compact_like,
+                ))
             rows = conn.execute(
                 """
                 SELECT
@@ -486,9 +520,8 @@ class LiveIMessageReader(IMessageReader):
                   )
                 GROUP BY user_id, display_name, handle_id, uncanonicalized_handle, resolved_service
                 ORDER BY MAX(m.date) DESC
-                LIMIT ?
                 """,
-                (*params, candidate_limit),
+                params,
             ).fetchall()
         finally:
             conn.close()
@@ -768,6 +801,7 @@ class LiveContactsReader(ContactsReader):
             raise IMessageError(f"Contacts database not found at {db_path}")
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
+        _register_lookup_functions(conn)
         return conn
 
     def _record_columns_sql(self, conn: sqlite3.Connection) -> str:
@@ -959,9 +993,29 @@ class LiveContactsReader(ContactsReader):
         search_terms = _query_lookup_terms(query)
         if not search_terms:
             raise ValueError("query is required")
-        contacts = []
-        seen_keys: set[tuple[str | None, str | None, str | None]] = set()
+        contacts_by_key: dict[tuple[str, str, str, str | None, str], tuple[int, dict[str, Any]]] = {}
         searched_paths: list[str] = []
+
+        def primary_value(items: list[dict[str, Any]] | None) -> str | None:
+            values = list(items or [])
+            if not values:
+                return None
+            primary = next((item for item in values if item.get("is_primary")), None)
+            selected = primary or values[0]
+            value = str(selected.get("value") or "").strip()
+            return value or None
+
+        def dedupe_key(contact: dict[str, Any]) -> tuple[str, str, str, str | None, str]:
+            phone = "".join(ch for ch in str(primary_value(contact.get("phone_numbers")) or "") if ch.isdigit())
+            email = str(primary_value(contact.get("email_addresses")) or "").strip().lower()
+            display_name = _normalize_lookup_text(
+                contact.get("display_name") or contact.get("first_name") or contact.get("organization")
+            )
+            fallback = ""
+            if not phone and not email:
+                fallback = f"{contact.get('source_db_path') or ''}:{contact.get('record_id') or ''}"
+            return (display_name, phone, email, contact.get("organization"), fallback)
+
         for db_path in self.db_paths:
             conn = self._connect(db_path)
             try:
@@ -980,6 +1034,18 @@ class LiveContactsReader(ContactsReader):
                             OR lower(COALESCE(r.ZMIDDLENAME, '')) LIKE ?
                             OR lower(COALESCE(r.ZNICKNAME, '')) LIKE ?
                             OR lower(COALESCE(r.ZORGANIZATION, '')) LIKE ?
+                            OR imessage_lookup_normalize(r.ZNAME) LIKE ?
+                            OR imessage_lookup_compact(r.ZNAME) LIKE ?
+                            OR imessage_lookup_normalize(r.ZFIRSTNAME) LIKE ?
+                            OR imessage_lookup_compact(r.ZFIRSTNAME) LIKE ?
+                            OR imessage_lookup_normalize(r.ZLASTNAME) LIKE ?
+                            OR imessage_lookup_compact(r.ZLASTNAME) LIKE ?
+                            OR imessage_lookup_normalize(r.ZMIDDLENAME) LIKE ?
+                            OR imessage_lookup_compact(r.ZMIDDLENAME) LIKE ?
+                            OR imessage_lookup_normalize(r.ZNICKNAME) LIKE ?
+                            OR imessage_lookup_compact(r.ZNICKNAME) LIKE ?
+                            OR imessage_lookup_normalize(r.ZORGANIZATION) LIKE ?
+                            OR imessage_lookup_compact(r.ZORGANIZATION) LIKE ?
                             OR EXISTS (
                                 SELECT 1
                                 FROM ZABCDPHONENUMBER p
@@ -1001,8 +1067,29 @@ class LiveContactsReader(ContactsReader):
                         )
                         """
                     )
-                    params.extend((like, like, like, like, like, like, like, compact_like, like))
-                candidate_limit = max(limit * 10, 50)
+                    params.extend((
+                        like,
+                        like,
+                        like,
+                        like,
+                        like,
+                        like,
+                        like,
+                        compact_like,
+                        like,
+                        compact_like,
+                        like,
+                        compact_like,
+                        like,
+                        compact_like,
+                        like,
+                        compact_like,
+                        like,
+                        compact_like,
+                        like,
+                        compact_like,
+                        like,
+                    ))
                 entity_where = self._record_entity_where_sql(conn)
                 search_where = "WHERE " + (entity_where.removeprefix("WHERE ") + " AND (" if entity_where else "(")
                 rows = conn.execute(
@@ -1016,21 +1103,14 @@ class LiveContactsReader(ContactsReader):
                     ORDER BY
                         lower(COALESCE(r.ZSORTINGLASTNAME, r.ZLASTNAME, '')),
                         lower(COALESCE(r.ZSORTINGFIRSTNAME, r.ZFIRSTNAME, ''))
-                    LIMIT ?
                     """,
-                    (*params, candidate_limit),
+                    params,
                 ).fetchall()
                 for row in rows:
                     contact = self._record_to_contact(conn, row, db_path)
                     phones = contact["phone_numbers"]
                     emails = contact["email_addresses"]
-                    dedupe_key = (
-                        row["ZNAME"],
-                        phones[0]["value"] if phones else None,
-                        emails[0]["value"] if emails else None,
-                    )
-                    if dedupe_key in seen_keys:
-                        continue
+                    key = dedupe_key(contact)
                     score = _lookup_match_score(
                         query,
                         [
@@ -1046,10 +1126,12 @@ class LiveContactsReader(ContactsReader):
                     )
                     if score is None:
                         continue
-                    seen_keys.add(dedupe_key)
-                    contacts.append((score, contact))
+                    existing = contacts_by_key.get(key)
+                    if existing is None or score > existing[0]:
+                        contacts_by_key[key] = (score, contact)
             finally:
                 conn.close()
+        contacts = list(contacts_by_key.values())
         contacts.sort(
             key=lambda item: (
                 -item[0],

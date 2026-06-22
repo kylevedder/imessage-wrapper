@@ -4,6 +4,8 @@ import sqlite3
 import subprocess
 from datetime import datetime, timezone
 
+import pytest
+
 from imessage_wrapper import IMessageClient
 import imessage_wrapper.core as core
 from imessage_wrapper.contacts_writer import ContactUpdatePayload, ContactsWriter
@@ -177,6 +179,99 @@ def test_client_lists_chats_and_enriches_contacts(tmp_path):
     assert chats[0].participants == ["+15550100001"]
 
 
+def test_client_search_chats_matches_accent_normalized_name(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    conn = sqlite3.connect(messages_db)
+    try:
+        conn.execute("UPDATE chat SET display_name = 'Émile Example' WHERE ROWID = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[])
+    chats = client.search_chats("emile")
+
+    assert [chat.display_name for chat in chats] == ["Émile Example"]
+
+
+def test_client_search_chats_scores_beyond_requested_limit(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    conn = sqlite3.connect(messages_db)
+    try:
+        older = apple_ns(datetime(2026, 5, 1, 12, tzinfo=timezone.utc))
+        newer = apple_ns(datetime(2026, 5, 2, 12, tzinfo=timezone.utc))
+        conn.execute("UPDATE chat SET display_name = 'Alex' WHERE ROWID = 1")
+        conn.execute("UPDATE message SET date = ? WHERE ROWID = 1", (older,))
+        conn.execute("INSERT INTO handle VALUES (2, '+15550100002', 'iMessage', '+1 (555) 010-0002')")
+        conn.execute(
+            """
+            INSERT INTO chat
+            VALUES (2, 'iMessage;-;+15550100002', '+15550100002', 'Alexandria Project', 'iMessage',
+                    'iMessage;+;me@example.test', 'me@example.test', '+15550100002')
+            """
+        )
+        conn.execute("INSERT INTO chat_handle_join VALUES (2, 2)")
+        conn.execute(
+            """
+            INSERT INTO message
+            VALUES (2, 'msg-2', 'newer partial match', NULL, NULL, 2, 'iMessage', ?, NULL, NULL,
+                    0, 1, NULL, NULL, NULL, NULL, NULL)
+            """,
+            (newer,),
+        )
+        conn.execute("INSERT INTO chat_message_join VALUES (2, 2)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[])
+    chats = client.search_chats("alex", limit=1)
+
+    assert [chat.display_name for chat in chats] == ["Alex"]
+
+
+def test_client_search_chats_scores_all_prefiltered_candidates(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    conn = sqlite3.connect(messages_db)
+    try:
+        old = apple_ns(datetime(2026, 5, 1, 12, tzinfo=timezone.utc))
+        conn.execute("UPDATE chat SET display_name = 'Alex Exact' WHERE ROWID = 1")
+        conn.execute("UPDATE message SET date = ? WHERE ROWID = 1", (old,))
+        for index in range(2, 53):
+            ts = apple_ns(datetime(2026, 5, 2, 12, index % 60, tzinfo=timezone.utc))
+            phone = f"+1555010{index:04d}"
+            conn.execute("INSERT INTO handle VALUES (?, ?, 'iMessage', ?)", (index, phone, phone))
+            conn.execute(
+                """
+                INSERT INTO chat
+                VALUES (?, ?, ?, ?, 'iMessage',
+                        'iMessage;+;me@example.test', 'me@example.test', ?)
+                """,
+                (index, f"iMessage;-;{phone}", phone, f"Alex Exact Project {index:02d}", phone),
+            )
+            conn.execute("INSERT INTO chat_handle_join VALUES (?, ?)", (index, index))
+            conn.execute(
+                """
+                INSERT INTO message
+                VALUES (?, ?, 'newer partial match', NULL, NULL, ?, 'iMessage', ?, NULL, NULL,
+                        0, 1, NULL, NULL, NULL, NULL, NULL)
+                """,
+                (index, f"msg-{index}", index, ts),
+            )
+            conn.execute("INSERT INTO chat_message_join VALUES (?, ?)", (index, index))
+        conn.commit()
+    finally:
+        conn.close()
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[])
+    chats = client.search_chats("alex exact", limit=1)
+
+    assert [chat.display_name for chat in chats] == ["Alex Exact"]
+
+
 def test_client_enrichment_prefers_specific_contact_over_aggregate_record(tmp_path):
     messages_db = tmp_path / "chat.db"
     contacts_db = tmp_path / "AddressBook-v22.abcddb"
@@ -284,6 +379,24 @@ def test_client_reads_messages_and_contacts_with_timestamps(tmp_path):
     assert contacts[0].modified_at.day == 2
 
 
+def test_client_rejects_invalid_search_and_contact_bounds(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    contacts_db = tmp_path / "AddressBook-v22.abcddb"
+    make_messages_db(messages_db)
+    make_contacts_db(contacts_db)
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[contacts_db])
+
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        client.search_chats("alex", limit=0)
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        client.search_messages("hello", limit=0)
+    with pytest.raises(ValueError, match="limit must be >= 1"):
+        client.search_contacts("alex", limit=0)
+    with pytest.raises(ValueError, match="offset must be >= 0"):
+        client.contacts(offset=-1)
+
+
 def test_client_reads_attributed_body_when_text_column_is_empty(tmp_path, monkeypatch):
     messages_db = tmp_path / "chat.db"
     make_messages_db(messages_db)
@@ -299,6 +412,39 @@ def test_client_reads_attributed_body_when_text_column_is_empty(tmp_path, monkey
     messages = client.messages(chat_id=1, limit=10)
 
     assert messages[0].text == "clean attributed body"
+
+
+def test_client_search_messages_finds_attributed_body_text(tmp_path, monkeypatch):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    conn = sqlite3.connect(messages_db)
+    try:
+        conn.execute("UPDATE message SET text = NULL, attributedBody = ? WHERE ROWID = 1", (b"streamtyped fixture",))
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(core, "_decode_attributed_body_text_with_foundation", lambda value: "clean attributed body")
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[])
+    messages = client.search_messages("attributed body")
+
+    assert [message.text for message in messages] == ["clean attributed body"]
+
+
+def test_client_reads_and_searches_subject_when_text_is_empty(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    conn = sqlite3.connect(messages_db)
+    try:
+        conn.execute("UPDATE message SET text = '', subject = 'subject only text' WHERE ROWID = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[])
+
+    assert [message.text for message in client.messages(chat_id=1)] == ["subject only text"]
+    assert [message.text for message in client.search_messages("subject only")] == ["subject only text"]
 
 
 def test_client_send_dry_run_uses_chat_id_target(tmp_path):

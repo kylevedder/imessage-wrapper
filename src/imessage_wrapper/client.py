@@ -144,6 +144,8 @@ class IMessageClient:
             return self._row_to_chat(conn, row) if row else None
 
     def search_chats(self, query: str, limit: int = 25) -> list[Chat]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
         needle = query.strip()
         if not needle:
             raise ValueError("query is required")
@@ -163,18 +165,26 @@ class IMessageClient:
                     lower(COALESCE(c.display_name, '')) LIKE ?
                     OR lower(COALESCE(c.chat_identifier, '')) LIKE ?
                     OR lower(COALESCE(c.guid, '')) LIKE ?
+                    OR imessage_lookup_normalize(c.display_name) LIKE ?
+                    OR imessage_lookup_compact(c.display_name) LIKE ?
+                    OR imessage_lookup_normalize(c.chat_identifier) LIKE ?
+                    OR imessage_lookup_compact(c.chat_identifier) LIKE ?
+                    OR imessage_lookup_normalize(c.guid) LIKE ?
+                    OR imessage_lookup_compact(c.guid) LIKE ?
                     OR EXISTS (
                         SELECT 1 FROM chat_handle_join chj
                         JOIN handle h ON h.ROWID = chj.handle_id
                         WHERE chj.chat_id = c.ROWID
                           AND (
                               lower(COALESCE(h.id, '')) LIKE ?
+                              OR imessage_lookup_normalize(h.id) LIKE ?
                               OR replace(replace(replace(replace(replace(lower(COALESCE(h.id, '')), '+', ''), ' ', ''), '-', ''), '(', ''), ')', '') LIKE ?
+                              OR imessage_lookup_compact(h.id) LIKE ?
                           )
                     )
                     """
                 )
-                params.extend([like, like, like, like, compact])
+                params.extend([like, like, like, like, compact, like, compact, like, compact, like, like, compact, compact])
             rows = conn.execute(
                 f"""
                 SELECT
@@ -189,9 +199,8 @@ class IMessageClient:
                 FROM chat c
                 WHERE {" OR ".join(f"({clause})" for clause in clauses)}
                 ORDER BY last_message_date DESC
-                LIMIT ?
                 """,
-                (*params, limit),
+                params,
             ).fetchall()
             chats = [self._row_to_chat(conn, row) for row in rows]
         scored = []
@@ -333,35 +342,48 @@ class IMessageClient:
                 kqueue.close()
 
     def search_messages(self, query: str, match: str = "contains", limit: int = 50) -> list[Message]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
         needle = query.strip()
         if not needle:
             raise ValueError("query is required")
         if match not in {"contains", "exact"}:
             raise ValueError("match must be 'contains' or 'exact'")
-        operator = "=" if match == "exact" else "LIKE"
-        value = needle if match == "exact" else f"%{needle}%"
         with self._connect_messages() as conn:
             schema = self._schema(conn)
             select = self._message_select(schema)
-            rows = conn.execute(
-                f"""
-                SELECT {select}
-                FROM message m
-                LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
-                LEFT JOIN handle h ON h.ROWID = m.handle_id
-                LEFT JOIN chat c ON c.ROWID = cmj.chat_id
-                WHERE COALESCE(m.text, '') {operator} ?
-                  AND ({self._non_reaction_filter(schema)})
-                ORDER BY m.date DESC, m.ROWID DESC
-                LIMIT ?
-                """,
-                (value, limit),
-            ).fetchall()
+            rows: list[sqlite3.Row] = []
+            page_size = max(limit * 10, 100)
+            offset = 0
+            while len(rows) < limit:
+                page = conn.execute(
+                    f"""
+                    SELECT {select}
+                    FROM message m
+                    LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+                    LEFT JOIN handle h ON h.ROWID = m.handle_id
+                    LEFT JOIN chat c ON c.ROWID = cmj.chat_id
+                    WHERE ({self._non_reaction_filter(schema)})
+                    ORDER BY m.date DESC, m.ROWID DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (page_size, offset),
+                ).fetchall()
+                if not page:
+                    break
+                for row in page:
+                    if self._message_text_matches(row, needle, match):
+                        rows.append(row)
+                        if len(rows) >= limit:
+                            break
+                offset += len(page)
             return self._rows_to_messages(conn, list(reversed(rows)), include_attachments=False)
 
     def contacts(self, limit: int = 5000, offset: int = 0) -> list[Contact]:
         if limit < 1:
             raise ValueError("limit must be >= 1")
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
         all_contacts = self._load_contacts()
         return all_contacts[offset:offset + limit]
 
@@ -375,6 +397,8 @@ class IMessageClient:
             offset += len(batch)
 
     def search_contacts(self, query: str, limit: int = 25) -> list[Contact]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
         needle = query.strip()
         if not needle:
             raise ValueError("query is required")
@@ -536,6 +560,7 @@ class IMessageClient:
             raise core.IMessageError(f"Messages database not found at {self.messages_db_path}")
         conn = sqlite3.connect(f"file:{self.messages_db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
+        core._register_lookup_functions(conn)
         return conn
 
     def _schema(self, conn: sqlite3.Connection) -> _Schema:
@@ -576,7 +601,7 @@ class IMessageClient:
             {col("guid")} AS guid,
             m.handle_id AS handle_rowid,
             h.id AS sender,
-            COALESCE(m.text, m.subject, '') AS text,
+            COALESCE(NULLIF(m.text, ''), {col("subject")}, '') AS text,
             {col("attributedBody")} AS attributed_body,
             m.date AS message_date,
             m.is_from_me AS is_from_me,
@@ -674,6 +699,12 @@ class IMessageClient:
                 )
             )
         return messages
+
+    def _message_text_matches(self, row: sqlite3.Row, needle: str, match: str) -> bool:
+        text = row["text"] or core._extract_attributed_body_text(row["attributed_body"]) or ""
+        if match == "exact":
+            return text == needle
+        return needle.casefold() in text.casefold()
 
     def _participants(self, conn: sqlite3.Connection, chat_id: int) -> list[str]:
         try:
