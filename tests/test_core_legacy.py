@@ -764,6 +764,66 @@ def test_live_contacts_reader_matches_accented_and_apostrophe_names(tmp_path):
     assert by_slash["contacts"][0]["display_name"] == "Slash Example"
 
 
+def test_live_contacts_reader_search_preserves_duplicate_bare_contacts(tmp_path):
+    db_path = tmp_path / "AddressBook-v22.abcddb"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE ZABCDRECORD (
+                Z_PK INTEGER PRIMARY KEY,
+                ZNAME TEXT,
+                ZFIRSTNAME TEXT,
+                ZMIDDLENAME TEXT,
+                ZLASTNAME TEXT,
+                ZNICKNAME TEXT,
+                ZORGANIZATION TEXT,
+                ZSORTINGFIRSTNAME TEXT,
+                ZSORTINGLASTNAME TEXT
+            );
+            CREATE TABLE ZABCDPHONENUMBER (
+                Z_PK INTEGER PRIMARY KEY,
+                ZOWNER INTEGER,
+                Z22_OWNER INTEGER,
+                ZFULLNUMBER TEXT,
+                ZLABEL TEXT,
+                ZISPRIMARY INTEGER,
+                ZORDERINGINDEX INTEGER
+            );
+            CREATE TABLE ZABCDEMAILADDRESS (
+                Z_PK INTEGER PRIMARY KEY,
+                ZOWNER INTEGER,
+                Z22_OWNER INTEGER,
+                ZADDRESS TEXT,
+                ZLABEL TEXT,
+                ZISPRIMARY INTEGER,
+                ZORDERINGINDEX INTEGER
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ZABCDRECORD
+            (Z_PK, ZNAME, ZFIRSTNAME, ZMIDDLENAME, ZLASTNAME, ZNICKNAME, ZORGANIZATION, ZSORTINGFIRSTNAME, ZSORTINGLASTNAME)
+            VALUES (1, 'Casey Example', 'Casey', NULL, 'Example', NULL, NULL, 'Casey', 'Example')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ZABCDRECORD
+            (Z_PK, ZNAME, ZFIRSTNAME, ZMIDDLENAME, ZLASTNAME, ZNICKNAME, ZORGANIZATION, ZSORTINGFIRSTNAME, ZSORTINGLASTNAME)
+            VALUES (2, 'Casey Example', 'Casey', NULL, 'Example', NULL, NULL, 'Casey', 'Example')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = LiveContactsReader([db_path])._search_contacts_sync("casey", limit=10)
+
+    assert [contact["record_id"] for contact in result["contacts"]] == [1, 2]
+
+
 def test_live_contacts_reader_rejects_punctuation_only_query(tmp_path):
     db_path = tmp_path / "AddressBook-v22.abcddb"
     conn = sqlite3.connect(db_path)
