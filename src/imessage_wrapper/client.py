@@ -47,6 +47,7 @@ class IMessageClient:
         contacts_sources_dir: str | Path | None = None,
         home: str | Path | None = None,
         send_timeout: int = core.DEFAULT_SEND_TIMEOUT_SECONDS,
+        verification_timeout: float = 10.0,
         verify_sends: bool = True,
         enrich_contacts: bool = True,
         region: str = "US",
@@ -55,6 +56,7 @@ class IMessageClient:
         self.messages_db_path = Path(messages_db_path).expanduser() if messages_db_path else self.home / "Library" / "Messages" / "chat.db"
         self.contacts_db_paths = self._contacts_paths(contacts_db_paths, contacts_sources_dir)
         self.send_timeout = send_timeout
+        self.verification_timeout = verification_timeout
         self.verify_sends = verify_sends
         self.enrich_contacts = enrich_contacts
         self.region = region
@@ -1052,15 +1054,16 @@ end run
     ) -> Message | None:
         if not text.strip():
             return None
-        deadline = time.monotonic() + 2.0
+        deadline = time.monotonic() + self.verification_timeout
         start = sent_at.timestamp() - 2
         start_apple = int((datetime.fromtimestamp(start, timezone.utc) - core.APPLE_EPOCH).total_seconds() * 1_000_000_000)
+        expected_text = core._normalize_message_text(text)
         while time.monotonic() < deadline:
             with self._connect_messages() as conn:
                 schema = self._schema(conn)
                 select = self._message_select(schema)
-                where = ["m.is_from_me = 1", "COALESCE(m.text, '') = ?", "m.date >= ?", "m.ROWID > ?"]
-                params: list[Any] = [text, start_apple, min_rowid]
+                where = ["m.is_from_me = 1", "m.date >= ?", "m.ROWID > ?"]
+                params: list[Any] = [start_apple, min_rowid]
                 if chat_id is not None:
                     where.append("cmj.chat_id = ?")
                     params.append(chat_id)
@@ -1074,7 +1077,7 @@ end run
                     if identity_sql:
                         where.append(identity_sql)
                         params.extend(identity_params)
-                row = conn.execute(
+                rows = conn.execute(
                     f"""
                     SELECT {select}
                     FROM message m
@@ -1083,12 +1086,13 @@ end run
                     LEFT JOIN chat c ON c.ROWID = cmj.chat_id
                     WHERE {" AND ".join(where)}
                     ORDER BY m.date DESC, m.ROWID DESC
-                    LIMIT 1
+                    LIMIT 25
                     """,
                     params,
-                ).fetchone()
-                if row:
-                    return self._rows_to_messages(conn, [row], include_attachments=False)[0]
+                ).fetchall()
+                for message in self._rows_to_messages(conn, list(rows), include_attachments=False):
+                    if core._normalize_message_text(message.text) == expected_text:
+                        return message
             time.sleep(0.1)
         return None
 

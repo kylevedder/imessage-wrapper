@@ -592,7 +592,7 @@ def test_client_live_send_does_not_verify_preexisting_same_text_row(tmp_path, mo
     def fake_run(cmd, input, text, capture_output, timeout, check, env):
         return subprocess.CompletedProcess(cmd, 0, stdout="sent\n", stderr="")
 
-    ticks = iter([0.0, 0.0, 3.0])
+    ticks = iter([0.0, 0.0, 11.0])
     monkeypatch.setattr("imessage_wrapper.client.subprocess.run", fake_run)
     monkeypatch.setattr("imessage_wrapper.client.time.monotonic", lambda: next(ticks))
     monkeypatch.setattr("imessage_wrapper.client.time.sleep", lambda _: None)
@@ -603,6 +603,40 @@ def test_client_live_send_does_not_verify_preexisting_same_text_row(tmp_path, mo
     assert result.sent is True
     assert result.verified is False
     assert result.message_id is None
+
+
+def test_client_live_send_verifies_attributed_body_text(tmp_path, monkeypatch):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    payload = b"streamtyped fixture"
+
+    def fake_run(cmd, input, text, capture_output, timeout, check, env):
+        conn = sqlite3.connect(messages_db)
+        try:
+            conn.execute(
+                """
+                INSERT INTO message
+                VALUES (2, 'sent-guid', NULL, NULL, ?, NULL, 'iMessage', ?, NULL, NULL,
+                        1, 1, NULL, NULL, NULL, NULL, 'me@example.test')
+                """,
+                (payload, apple_ns(datetime.now(timezone.utc))),
+            )
+            conn.execute("INSERT INTO chat_message_join VALUES (1, 2)")
+            conn.commit()
+        finally:
+            conn.close()
+        return subprocess.CompletedProcess(cmd, 0, stdout="sent\n", stderr="")
+
+    monkeypatch.setattr("imessage_wrapper.client.subprocess.run", fake_run)
+    monkeypatch.setattr(core, "_decode_attributed_body_text_with_foundation", lambda value: "sent attributed text")
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[], home=tmp_path)
+
+    result = client.send(chat_id=1, text="sent attributed text")
+
+    assert result.sent is True
+    assert result.verified is True
+    assert result.message_id == 2
+    assert result.message_guid == "sent-guid"
 
 
 def test_wait_for_sent_message_filters_by_direct_recipient(tmp_path):
