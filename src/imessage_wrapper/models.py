@@ -149,6 +149,9 @@ class SendResult:
     file_paths: list[str] = field(default_factory=list)
     sent: bool = False
     verified: bool | None = None
+    delivery_status: str | None = None
+    message_service: str | None = None
+    message_error: int | None = None
     dry_run: bool = False
     message_id: int | None = None
     message_guid: str | None = None

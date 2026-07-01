@@ -108,6 +108,22 @@ def make_messages_db(path):
         conn.close()
 
 
+def add_send_status_columns(path):
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            ALTER TABLE message ADD COLUMN is_sent INTEGER;
+            ALTER TABLE message ADD COLUMN is_delivered INTEGER;
+            ALTER TABLE message ADD COLUMN is_finished INTEGER;
+            ALTER TABLE message ADD COLUMN error INTEGER;
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def make_contacts_db(path):
     conn = sqlite3.connect(path)
     try:
@@ -567,6 +583,7 @@ def test_client_live_send_verifies_inserted_row(tmp_path, monkeypatch):
 
     assert result.sent is True
     assert result.verified is True
+    assert result.delivery_status == "recorded"
     assert result.message_id == 2
     assert result.message_guid == "sent-guid"
 
@@ -635,8 +652,182 @@ def test_client_live_send_verifies_attributed_body_text(tmp_path, monkeypatch):
 
     assert result.sent is True
     assert result.verified is True
+    assert result.delivery_status == "recorded"
     assert result.message_id == 2
     assert result.message_guid == "sent-guid"
+
+
+def test_client_live_send_waits_for_imessage_delivery_status(tmp_path, monkeypatch):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    add_send_status_columns(messages_db)
+
+    def fake_run(cmd, input, text, capture_output, timeout, check, env):
+        conn = sqlite3.connect(messages_db)
+        try:
+            conn.execute(
+                """
+                INSERT INTO message
+                    (ROWID, guid, text, handle_id, service, date, is_from_me, is_read,
+                     destination_caller_id, is_sent, is_delivered, is_finished, error)
+                VALUES (2, 'pending-guid', 'pending text', NULL, 'iMessage', ?, 1, 1,
+                        'me@example.test', 0, 0, 0, 0)
+                """,
+                (apple_ns(datetime.now(timezone.utc)),),
+            )
+            conn.execute("INSERT INTO chat_message_join VALUES (1, 2)")
+            conn.commit()
+        finally:
+            conn.close()
+        return subprocess.CompletedProcess(cmd, 0, stdout="sent\n", stderr="")
+
+    ticks = iter([0.0, 0.0, 11.0])
+    monkeypatch.setattr("imessage_wrapper.client.subprocess.run", fake_run)
+    monkeypatch.setattr("imessage_wrapper.client.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("imessage_wrapper.client.time.sleep", lambda _: None)
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[], home=tmp_path)
+
+    result = client.send(chat_id=1, text="pending text")
+
+    assert result.sent is True
+    assert result.verified is False
+    assert result.delivery_status == "pending"
+    assert result.message_service == "iMessage"
+    assert result.message_error == 0
+    assert result.message_id == 2
+    assert result.message_guid == "pending-guid"
+    assert result.error == "Messages did not confirm delivery before verification timed out"
+
+
+def test_client_live_send_verifies_imessage_after_delivery_status_updates(tmp_path, monkeypatch):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    add_send_status_columns(messages_db)
+
+    def fake_run(cmd, input, text, capture_output, timeout, check, env):
+        conn = sqlite3.connect(messages_db)
+        try:
+            conn.execute(
+                """
+                INSERT INTO message
+                    (ROWID, guid, text, handle_id, service, date, is_from_me, is_read,
+                     destination_caller_id, is_sent, is_delivered, is_finished, error)
+                VALUES (2, 'delivered-guid', 'delivered text', NULL, 'RCS', ?, 1, 1,
+                        'me@example.test', 1, 0, 0, 0)
+                """,
+                (apple_ns(datetime.now(timezone.utc)),),
+            )
+            conn.execute("INSERT INTO chat_message_join VALUES (1, 2)")
+            conn.commit()
+        finally:
+            conn.close()
+        return subprocess.CompletedProcess(cmd, 0, stdout="sent\n", stderr="")
+
+    def mark_delivered(_):
+        conn = sqlite3.connect(messages_db)
+        try:
+            conn.execute(
+                "UPDATE message SET is_delivered = 1, date_delivered = ?, is_finished = 1 WHERE ROWID = 2",
+                (apple_ns(datetime.now(timezone.utc)),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    ticks = iter([0.0, 0.0, 1.0])
+    monkeypatch.setattr("imessage_wrapper.client.subprocess.run", fake_run)
+    monkeypatch.setattr("imessage_wrapper.client.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("imessage_wrapper.client.time.sleep", mark_delivered)
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[], home=tmp_path)
+
+    result = client.send(chat_id=1, text="delivered text")
+
+    assert result.sent is True
+    assert result.verified is True
+    assert result.delivery_status == "delivered"
+    assert result.message_service == "RCS"
+    assert result.message_error == 0
+    assert result.message_id == 2
+    assert result.message_guid == "delivered-guid"
+    assert result.error is None
+
+
+def test_client_live_send_reports_messages_error_status(tmp_path, monkeypatch):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    add_send_status_columns(messages_db)
+
+    def fake_run(cmd, input, text, capture_output, timeout, check, env):
+        conn = sqlite3.connect(messages_db)
+        try:
+            conn.execute(
+                """
+                INSERT INTO message
+                    (ROWID, guid, text, handle_id, service, date, is_from_me, is_read,
+                     destination_caller_id, is_sent, is_delivered, is_finished, error)
+                VALUES (2, 'failed-guid', 'failed text', NULL, 'RCS', ?, 1, 1,
+                        'me@example.test', 0, 0, 1, 42)
+                """,
+                (apple_ns(datetime.now(timezone.utc)),),
+            )
+            conn.execute("INSERT INTO chat_message_join VALUES (1, 2)")
+            conn.commit()
+        finally:
+            conn.close()
+        return subprocess.CompletedProcess(cmd, 0, stdout="sent\n", stderr="")
+
+    monkeypatch.setattr("imessage_wrapper.client.subprocess.run", fake_run)
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[], home=tmp_path)
+
+    result = client.send(chat_id=1, text="failed text")
+
+    assert result.sent is True
+    assert result.verified is False
+    assert result.delivery_status == "failed"
+    assert result.message_service == "RCS"
+    assert result.message_error == 42
+    assert result.message_id == 2
+    assert result.message_guid == "failed-guid"
+    assert result.error == "Messages reported send error 42"
+
+
+def test_client_live_send_verifies_sms_sent_status(tmp_path, monkeypatch):
+    messages_db = tmp_path / "chat.db"
+    make_messages_db(messages_db)
+    add_send_status_columns(messages_db)
+
+    def fake_run(cmd, input, text, capture_output, timeout, check, env):
+        conn = sqlite3.connect(messages_db)
+        try:
+            conn.execute(
+                """
+                INSERT INTO message
+                    (ROWID, guid, text, handle_id, service, date, is_from_me, is_read,
+                     destination_caller_id, is_sent, is_delivered, is_finished, error)
+                VALUES (2, 'sms-guid', 'sms text', NULL, 'SMS', ?, 1, 1,
+                        'me@example.test', 1, 0, 1, 0)
+                """,
+                (apple_ns(datetime.now(timezone.utc)),),
+            )
+            conn.execute("INSERT INTO chat_message_join VALUES (1, 2)")
+            conn.commit()
+        finally:
+            conn.close()
+        return subprocess.CompletedProcess(cmd, 0, stdout="sent\n", stderr="")
+
+    monkeypatch.setattr("imessage_wrapper.client.subprocess.run", fake_run)
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[], home=tmp_path)
+
+    result = client.send(chat_id=1, text="sms text")
+
+    assert result.sent is True
+    assert result.verified is True
+    assert result.delivery_status == "sent"
+    assert result.message_service == "SMS"
+    assert result.message_error == 0
+    assert result.message_id == 2
+    assert result.message_guid == "sms-guid"
+    assert result.error is None
 
 
 def test_wait_for_sent_message_filters_by_direct_recipient(tmp_path):
@@ -677,7 +868,7 @@ def test_wait_for_sent_message_filters_by_direct_recipient(tmp_path):
         conn.close()
 
     client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[], home=tmp_path)
-    message = client._wait_for_sent_message(
+    verification = client._wait_for_sent_message(
         text="collision text",
         chat_id=None,
         chat_identifier=None,
@@ -687,5 +878,5 @@ def test_wait_for_sent_message_filters_by_direct_recipient(tmp_path):
         sent_at=sent_at,
     )
 
-    assert message is not None
-    assert message.id == 3
+    assert verification is not None
+    assert verification.message.id == 3

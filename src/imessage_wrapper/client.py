@@ -39,6 +39,16 @@ class _Schema:
     handle: set[str]
 
 
+@dataclass(frozen=True)
+class _SendVerification:
+    message: Message
+    verified: bool
+    delivery_status: str
+    message_service: str | None
+    message_error: int | None
+    error: str | None = None
+
+
 class IMessageClient:
     def __init__(
         self,
@@ -466,6 +476,10 @@ class IMessageClient:
         verified = None
         message_id = None
         message_guid = None
+        delivery_status = None
+        message_service = None
+        message_error = None
+        send_error = None
         if should_verify:
             found = self._wait_for_sent_message(
                 text=text,
@@ -476,18 +490,26 @@ class IMessageClient:
                 min_rowid=pre_send_rowid,
                 sent_at=sent_at,
             )
-            verified = found is not None if text.strip() else None
+            verified = found.verified if found is not None else False if text.strip() else None
             if found is not None:
-                message_id = found.id
-                message_guid = found.guid
+                message_id = found.message.id
+                message_guid = found.message.guid
+                delivery_status = found.delivery_status
+                message_service = found.message_service
+                message_error = found.message_error
+                send_error = found.error
         return SendResult(
             recipient=target,
             text=text,
             file_paths=files,
             sent=True,
             verified=verified,
+            delivery_status=delivery_status,
+            message_service=message_service,
+            message_error=message_error,
             message_id=message_id,
             message_guid=message_guid,
+            error=send_error,
         )
 
     def create_contact(
@@ -609,6 +631,11 @@ class IMessageClient:
             m.is_from_me AS is_from_me,
             {col("is_read", "NULL")} AS is_read,
             m.service AS message_service,
+            {col("is_sent", "NULL")} AS is_sent,
+            {col("is_delivered", "NULL")} AS is_delivered,
+            {col("is_finished", "NULL")} AS is_finished,
+            {col("error", "NULL")} AS message_error,
+            {col("date_delivered", "NULL")} AS date_delivered,
             {col("associated_message_guid")} AS associated_message_guid,
             {col("associated_message_type")} AS associated_message_type,
             {col("associated_message_emoji")} AS associated_message_emoji,
@@ -1051,13 +1078,14 @@ end run
         recipient: str | None,
         min_rowid: int,
         sent_at: datetime,
-    ) -> Message | None:
+    ) -> _SendVerification | None:
         if not text.strip():
             return None
         deadline = time.monotonic() + self.verification_timeout
         start = sent_at.timestamp() - 2
         start_apple = int((datetime.fromtimestamp(start, timezone.utc) - core.APPLE_EPOCH).total_seconds() * 1_000_000_000)
         expected_text = core._normalize_message_text(text)
+        best_match = None
         while time.monotonic() < deadline:
             with self._connect_messages() as conn:
                 schema = self._schema(conn)
@@ -1090,11 +1118,124 @@ end run
                     """,
                     params,
                 ).fetchall()
-                for message in self._rows_to_messages(conn, list(rows), include_attachments=False):
+                messages = self._rows_to_messages(conn, list(rows), include_attachments=False)
+                for row, message in zip(rows, messages):
                     if core._normalize_message_text(message.text) == expected_text:
-                        return message
+                        verification = self._classify_send_verification(row, message, schema)
+                        best_match = verification
+                        if verification.delivery_status in {"pending", "sent"} and not verification.verified:
+                            continue
+                        return verification
             time.sleep(0.1)
+        if best_match is not None:
+            return self._timeout_send_verification(best_match)
         return None
+
+    def _classify_send_verification(
+        self,
+        row: sqlite3.Row,
+        message: Message,
+        schema: _Schema,
+    ) -> _SendVerification:
+        status_columns = {"is_sent", "is_delivered", "is_finished", "error"}
+        message_service = message.service
+        message_error = self._optional_int(row["message_error"])
+        if not (schema.message & status_columns):
+            return _SendVerification(
+                message=message,
+                verified=True,
+                delivery_status="recorded",
+                message_service=message_service,
+                message_error=message_error,
+            )
+
+        is_sent = self._optional_bool(row["is_sent"])
+        is_delivered = self._optional_bool(row["is_delivered"])
+        is_finished = self._optional_bool(row["is_finished"])
+        date_delivered = self._optional_int(row["date_delivered"])
+        if message_error not in {None, 0}:
+            return _SendVerification(
+                message=message,
+                verified=False,
+                delivery_status="failed",
+                message_service=message_service,
+                message_error=message_error,
+                error=f"Messages reported send error {message_error}",
+            )
+        if is_finished is True and is_sent is False:
+            return _SendVerification(
+                message=message,
+                verified=False,
+                delivery_status="failed",
+                message_service=message_service,
+                message_error=message_error,
+                error="Messages finished the send without marking it sent",
+            )
+
+        service = (message_service or "").casefold()
+        delivered = is_delivered is True or bool(date_delivered)
+        if service in {"imessage", "rcs"}:
+            if delivered:
+                return _SendVerification(
+                    message=message,
+                    verified=True,
+                    delivery_status="delivered",
+                    message_service=message_service,
+                    message_error=message_error,
+                )
+            if is_sent is True:
+                return _SendVerification(
+                    message=message,
+                    verified=False,
+                    delivery_status="sent",
+                    message_service=message_service,
+                    message_error=message_error,
+                )
+            return _SendVerification(
+                message=message,
+                verified=False,
+                delivery_status="pending",
+                message_service=message_service,
+                message_error=message_error,
+            )
+
+        if is_sent is True:
+            return _SendVerification(
+                message=message,
+                verified=True,
+                delivery_status="sent",
+                message_service=message_service,
+                message_error=message_error,
+            )
+        return _SendVerification(
+            message=message,
+            verified=False,
+            delivery_status="pending",
+            message_service=message_service,
+            message_error=message_error,
+        )
+
+    def _timeout_send_verification(self, verification: _SendVerification) -> _SendVerification:
+        if verification.verified or verification.error:
+            return verification
+        return _SendVerification(
+            message=verification.message,
+            verified=False,
+            delivery_status=verification.delivery_status,
+            message_service=verification.message_service,
+            message_error=verification.message_error,
+            error="Messages did not confirm delivery before verification timed out",
+        )
+
+    def _optional_bool(self, value: Any) -> bool | None:
+        if value is None:
+            return None
+        return bool(value)
+
+    def _optional_int(self, value: Any) -> int | None:
+        if value is None:
+            return None
+        return int(value)
 
     def _sent_message_identity_sql(
         self,
