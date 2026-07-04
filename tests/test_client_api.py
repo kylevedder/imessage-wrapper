@@ -211,6 +211,19 @@ def test_client_search_chats_matches_accent_normalized_name(tmp_path):
     assert [chat.display_name for chat in chats] == ["Émile Example"]
 
 
+def test_client_search_chats_matches_enriched_contact_name(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    contacts_db = tmp_path / "AddressBook-v22.abcddb"
+    make_messages_db(messages_db)
+    make_contacts_db(contacts_db)
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[contacts_db])
+    chats = client.search_chats("Alex Example")
+
+    assert [chat.id for chat in chats] == [1]
+    assert chats[0].name == "Alex Example"
+
+
 def test_client_search_chats_scores_beyond_requested_limit(tmp_path):
     messages_db = tmp_path / "chat.db"
     make_messages_db(messages_db)

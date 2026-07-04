@@ -164,6 +164,7 @@ class IMessageClient:
         terms = core._query_lookup_terms(needle)
         if not terms:
             raise ValueError("query is required")
+        contact_candidates = sorted(self._matching_contact_handle_candidates(needle)) if self.enrich_contacts else []
         with self._connect_messages() as conn:
             schema = self._schema(conn)
             routing = self._chat_routing_sql(schema)
@@ -197,6 +198,26 @@ class IMessageClient:
                     """
                 )
                 params.extend([like, like, like, like, compact, like, compact, like, compact, like, like, compact, compact])
+            if contact_candidates:
+                placeholders = ", ".join("?" for _ in contact_candidates)
+                contact_handle_parts = [f"h.id IN ({placeholders})"]
+                contact_handle_params = [*contact_candidates]
+                if "uncanonicalized_id" in schema.handle:
+                    contact_handle_parts.append(f"h.uncanonicalized_id IN ({placeholders})")
+                    contact_handle_params.extend(contact_candidates)
+                clauses.append(
+                    f"""
+                    c.chat_identifier IN ({placeholders})
+                    OR c.guid IN ({placeholders})
+                    OR EXISTS (
+                        SELECT 1 FROM chat_handle_join chj
+                        JOIN handle h ON h.ROWID = chj.handle_id
+                        WHERE chj.chat_id = c.ROWID
+                          AND ({" OR ".join(contact_handle_parts)})
+                    )
+                    """
+                )
+                params.extend([*contact_candidates, *contact_candidates, *contact_handle_params])
             rows = conn.execute(
                 f"""
                 SELECT
@@ -225,6 +246,28 @@ class IMessageClient:
                 scored.append((score, item.last_message_at or datetime.min.replace(tzinfo=timezone.utc), item))
         scored.sort(key=lambda item: (-item[0], -item[1].timestamp(), item[2].name.lower()))
         return [item[2] for item in scored[:limit]]
+
+    def _matching_contact_handle_candidates(self, query: str) -> set[str]:
+        handles: list[str] = []
+        for contact in self._load_contacts():
+            score = core._lookup_match_score(
+                query,
+                [
+                    contact.display_name,
+                    contact.first_name,
+                    contact.middle_name,
+                    contact.last_name,
+                    contact.nickname,
+                    contact.organization,
+                    *(phone.value for phone in contact.phones),
+                    *(email.value for email in contact.emails),
+                ],
+            )
+            if score is None:
+                continue
+            handles.extend(phone.value for phone in contact.phones)
+            handles.extend(email.value for email in contact.emails)
+        return self._handle_candidates(handles)
 
     def messages(
         self,
