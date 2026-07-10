@@ -41,11 +41,20 @@ from imessage_wrapper import IMessageClient
 client = IMessageClient()
 
 for chat in client.chats(limit=10):
-    print(chat.id, chat.name, chat.last_message_at)
+    print(chat.id, chat.name, chat.last_message_at, chat.unread_count)
 
 messages = client.messages(chat_id=chat.id, limit=50, attachments=True)
+unread_chats = client.chats(unread_only=True)
+stats = client.stats(time_zone="America/Los_Angeles", include_media=True)
+print(stats.total_messages, stats.media.total_bytes if stats.media else 0)
 client.send(chat_id=chat.id, text="hello")
 ```
+
+When supported by the local Messages schema, chats include logical inbound
+`unread_count` values. Inbound messages expose `is_read` and an optional
+`date_read`; outbound and legacy-schema message dictionaries omit those fields.
+Statistics exclude reaction rows, fold split URL previews into one logical
+message, and count each attachment once even when join rows are duplicated.
 
 ## Permissions
 

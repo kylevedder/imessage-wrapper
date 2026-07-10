@@ -98,10 +98,13 @@ class Chat:
     account_id: str | None = None
     account_login: str | None = None
     last_addressed_handle: str | None = None
+    unread_count: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["last_message_at"] = self.last_message_at.isoformat() if self.last_message_at else None
+        if self.unread_count is None:
+            data.pop("unread_count", None)
         return data
 
 
@@ -135,10 +138,18 @@ class Message:
     reaction_type: str | None = None
     reaction_emoji: str | None = None
     reacted_to_guid: str | None = None
+    date_read: datetime | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["created_at"] = self.created_at.isoformat() if self.created_at else None
+        if self.is_from_me or self.is_read is None:
+            data.pop("is_read", None)
+            data.pop("date_read", None)
+        elif self.date_read is not None:
+            data["date_read"] = self.date_read.isoformat()
+        else:
+            data.pop("date_read", None)
         return data
 
 
@@ -160,3 +171,95 @@ class SendResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class ChatMessageStats:
+    chat_id: int
+    identifier: str
+    name: str
+    service: str
+    message_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class SenderMessageStats:
+    handle: str
+    message_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ServiceMessageStats:
+    service: str
+    message_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class DateMessageStats:
+    date: str
+    message_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MediaTypeStats:
+    uti: str
+    mime_type: str
+    attachment_count: int
+    total_bytes: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ChatMediaStats:
+    chat_id: int
+    identifier: str
+    name: str
+    attachment_count: int
+    total_bytes: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MediaStats:
+    total_attachments: int
+    total_bytes: int
+    types: list[MediaTypeStats] = field(default_factory=list)
+    chats: list[ChatMediaStats] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MessageStats:
+    total_messages: int
+    sent_messages: int
+    received_messages: int
+    time_zone: str
+    chats: list[ChatMessageStats] = field(default_factory=list)
+    senders: list[SenderMessageStats] = field(default_factory=list)
+    services: list[ServiceMessageStats] = field(default_factory=list)
+    dates: list[DateMessageStats] = field(default_factory=list)
+    media: MediaStats | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        if self.media is None:
+            data.pop("media", None)
+        return data
