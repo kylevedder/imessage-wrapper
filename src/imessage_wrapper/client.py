@@ -6,23 +6,32 @@ import shutil
 import sqlite3
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import core
 from .contacts_writer import ContactUpdatePayload, ContactWritePayload, ContactsWriter
 from .models import (
     Attachment,
     Chat,
+    ChatMediaStats,
+    ChatMessageStats,
     Contact,
+    DateMessageStats,
     EmailAddress,
+    MediaStats,
+    MediaTypeStats,
     Message,
+    MessageStats,
     PhoneNumber,
     Reaction,
+    SenderMessageStats,
     SendResult,
+    ServiceMessageStats,
 )
 
 try:
@@ -49,6 +58,57 @@ class _SendVerification:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class _LogicalMessage:
+    rowid: int
+    chat_id: int
+    sender: str
+    text: str
+    created_at: datetime | None
+    is_from_me: bool
+    service: str
+    handle_id: int | None
+    balloon_bundle_id: str | None
+    is_read: bool | None
+
+
+@dataclass
+class _MessageStatsAccumulator:
+    total_messages: int = 0
+    sent_messages: int = 0
+    received_messages: int = 0
+    chat_counts: dict[int, int] = field(default_factory=dict)
+    chat_dimensions: dict[int, tuple[str, str, str]] = field(default_factory=dict)
+    sender_counts: dict[str, int] = field(default_factory=dict)
+    service_counts: dict[str, int] = field(default_factory=dict)
+    date_counts: dict[str, int] = field(default_factory=dict)
+
+    def add_chat(self, message: _LogicalMessage, dimension: tuple[str, str, str]) -> None:
+        self.chat_counts[message.chat_id] = self.chat_counts.get(message.chat_id, 0) + 1
+        self.chat_dimensions.setdefault(message.chat_id, dimension)
+
+    def add_global(self, message: _LogicalMessage, zone: Any) -> None:
+        self.total_messages += 1
+        if message.is_from_me:
+            self.sent_messages += 1
+        else:
+            self.received_messages += 1
+            sender = message.sender.strip() or "unknown"
+            self.sender_counts[sender] = self.sender_counts.get(sender, 0) + 1
+        service = message.service.strip() or "unknown"
+        self.service_counts[service] = self.service_counts.get(service, 0) + 1
+        created_at = message.created_at or core.APPLE_EPOCH
+        date_key = created_at.astimezone(zone).strftime("%Y-%m-%d")
+        self.date_counts[date_key] = self.date_counts.get(date_key, 0) + 1
+
+
+class MessageStatsError(core.IMessageError):
+    """Raised when a message statistics request cannot be evaluated safely."""
+
+
+_URL_PREVIEW_BALLOON_BUNDLE_ID = "com.apple.messages.URLBalloonProvider"
+
+
 class IMessageClient:
     def __init__(
         self,
@@ -73,37 +133,77 @@ class IMessageClient:
         self._contacts_cache: list[Contact] | None = None
         self._contact_index: dict[str, Contact] | None = None
 
-    def chats(self, limit: int = 100, offset: int = 0) -> list[Chat]:
+    def chats(self, limit: int = 100, offset: int = 0, unread_only: bool = False) -> list[Chat]:
         if limit < 1:
             raise ValueError("limit must be >= 1")
         if offset < 0:
             raise ValueError("offset must be >= 0")
         with self._connect_messages() as conn:
             schema = self._schema(conn)
+            if unread_only and "is_read" not in schema.message:
+                raise core.IMessageError(
+                    "Unread filtering is unavailable because this Messages database has no message.is_read column"
+                )
             routing = self._chat_routing_sql(schema)
             last_date_expr = "MAX(cmj.message_date)" if "message_date" in schema.chat_message_join else "MAX(m.date)"
             join_message = "" if "message_date" in schema.chat_message_join else "JOIN message m ON m.ROWID = cmj.message_id"
-            rows = conn.execute(
-                f"""
-                SELECT
-                    c.ROWID AS chat_id,
-                    c.chat_identifier,
-                    c.guid,
-                    c.display_name,
-                    c.service_name,
-                    COUNT(DISTINCT cmj.message_id) AS message_count,
-                    {last_date_expr} AS last_message_date,
-                    {routing}
-                FROM chat c
-                JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
-                {join_message}
-                GROUP BY c.ROWID
-                ORDER BY last_message_date DESC
-                LIMIT ? OFFSET ?
-                """,
-                (limit, offset),
-            ).fetchall()
-            return [self._row_to_chat(conn, row) for row in rows]
+            unread_join = ""
+            if unread_only:
+                unread_join = """
+                    JOIN (
+                        SELECT DISTINCT cmj_unread.chat_id
+                        FROM chat_message_join cmj_unread
+                        JOIN message m_unread ON m_unread.ROWID = cmj_unread.message_id
+                        WHERE m_unread.is_from_me = 0 AND m_unread.is_read = 0
+                    ) unread ON unread.chat_id = c.ROWID
+                """
+
+            def fetch_rows(batch_limit: int, batch_offset: int) -> list[sqlite3.Row]:
+                return conn.execute(
+                    f"""
+                    SELECT
+                        c.ROWID AS chat_id,
+                        c.chat_identifier,
+                        c.guid,
+                        c.display_name,
+                        c.service_name,
+                        COUNT(DISTINCT cmj.message_id) AS message_count,
+                        {last_date_expr} AS last_message_date,
+                        {routing}
+                    FROM chat c
+                    JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
+                    {join_message}
+                    {unread_join}
+                    GROUP BY c.ROWID
+                    ORDER BY last_message_date DESC, c.ROWID DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (batch_limit, batch_offset),
+                ).fetchall()
+
+            if not unread_only:
+                rows = fetch_rows(limit, offset)
+                counts = self._unread_counts(conn, schema, [int(row["chat_id"]) for row in rows])
+                return [self._row_to_chat(conn, row, counts.get(int(row["chat_id"]))) for row in rows]
+
+            needed = offset + limit
+            batch_size = max(50, needed)
+            candidate_offset = 0
+            matched: list[tuple[sqlite3.Row, int]] = []
+            while len(matched) < needed:
+                rows = fetch_rows(batch_size, candidate_offset)
+                if not rows:
+                    break
+                counts = self._unread_counts(conn, schema, [int(row["chat_id"]) for row in rows])
+                matched.extend(
+                    (row, counts[int(row["chat_id"])])
+                    for row in rows
+                    if counts.get(int(row["chat_id"]), 0) > 0
+                )
+                if len(rows) < batch_size:
+                    break
+                candidate_offset += len(rows)
+            return [self._row_to_chat(conn, row, count) for row, count in matched[offset:needed]]
 
     def iter_chats(self, page_size: int = 100) -> Iterator[Chat]:
         offset = 0
@@ -153,7 +253,10 @@ class IMessageClient:
                 """,
                 params,
             ).fetchone()
-            return self._row_to_chat(conn, row) if row else None
+            if not row:
+                return None
+            counts = self._unread_counts(conn, schema, [int(row["chat_id"])])
+            return self._row_to_chat(conn, row, counts.get(int(row["chat_id"])))
 
     def search_chats(self, query: str, limit: int = 25) -> list[Chat]:
         if limit < 1:
@@ -235,7 +338,8 @@ class IMessageClient:
                 """,
                 params,
             ).fetchall()
-            chats = [self._row_to_chat(conn, row) for row in rows]
+            counts = self._unread_counts(conn, schema, [int(row["chat_id"]) for row in rows])
+            chats = [self._row_to_chat(conn, row, counts.get(int(row["chat_id"]))) for row in rows]
         scored = []
         for item in chats:
             score = core._lookup_match_score(
@@ -434,6 +538,41 @@ class IMessageClient:
                 offset += len(page)
             return self._rows_to_messages(conn, list(reversed(rows)), include_attachments=False)
 
+    def stats(
+        self,
+        chat_id: int | None = None,
+        include_media: bool = False,
+        time_zone: str | None = None,
+    ) -> MessageStats:
+        """Return snapshot-consistent logical message and optional media statistics."""
+        if chat_id is not None and (isinstance(chat_id, bool) or not isinstance(chat_id, int) or chat_id <= 0):
+            raise MessageStatsError(f"chat_id must be a positive rowid (received {chat_id})")
+        time_zone_name, zone = self._stats_time_zone(time_zone)
+        conn = self._connect_messages()
+        try:
+            conn.execute("BEGIN")
+            schema = self._schema(conn)
+            if chat_id is not None:
+                found = conn.execute("SELECT 1 FROM chat WHERE ROWID = ? LIMIT 1", (chat_id,)).fetchone()
+                if found is None:
+                    raise MessageStatsError(f"chat_id {chat_id} does not exist")
+            accumulator = self._stats_messages(conn, schema, chat_id, zone)
+            media = self._stats_media(conn, schema, chat_id) if include_media else None
+            return self._build_message_stats(accumulator, time_zone_name, media)
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
+
+    def message_stats(
+        self,
+        chat_id: int | None = None,
+        include_media: bool = False,
+        time_zone: str | None = None,
+    ) -> MessageStats:
+        """Alias for :meth:`stats` using a descriptive Python API name."""
+        return self.stats(chat_id=chat_id, include_media=include_media, time_zone=time_zone)
+
     def contacts(self, limit: int = 5000, offset: int = 0) -> list[Contact]:
         if limit < 1:
             raise ValueError("limit must be >= 1")
@@ -601,6 +740,271 @@ class IMessageClient:
             ),
         )
 
+    def _stats_time_zone(self, identifier: str | None) -> tuple[str, Any]:
+        if identifier is not None:
+            value = str(identifier).strip()
+            if not value:
+                raise MessageStatsError("invalid IANA time zone: ")
+            try:
+                zone = ZoneInfo(value)
+                return self._canonical_time_zone_name(value), zone
+            except (ValueError, ZoneInfoNotFoundError) as exc:
+                raise MessageStatsError(f"invalid IANA time zone: {value}") from exc
+
+        configured = os.environ.get("TZ", "").strip()
+        if configured:
+            try:
+                return self._canonical_time_zone_name(configured), ZoneInfo(configured)
+            except (ValueError, ZoneInfoNotFoundError):
+                pass
+        try:
+            resolved_localtime = str(Path("/etc/localtime").resolve())
+            marker = "/zoneinfo/"
+            if marker in resolved_localtime:
+                local_identifier = resolved_localtime.split(marker, 1)[1]
+                return self._canonical_time_zone_name(local_identifier), ZoneInfo(local_identifier)
+        except (OSError, ValueError, ZoneInfoNotFoundError):
+            pass
+        local_zone = datetime.now().astimezone().tzinfo or timezone.utc
+        local_name = str(getattr(local_zone, "key", None) or local_zone)
+        return self._canonical_time_zone_name(local_name), local_zone
+
+    def _canonical_time_zone_name(self, identifier: str) -> str:
+        if identifier in {
+            "Etc/GMT",
+            "Etc/UCT",
+            "Etc/UTC",
+            "Etc/Universal",
+            "Etc/Zulu",
+            "GMT",
+            "GMT0",
+            "UCT",
+            "UTC",
+            "Universal",
+            "Zulu",
+        }:
+            return "GMT"
+        return identifier
+
+    def _stats_messages(
+        self,
+        conn: sqlite3.Connection,
+        schema: _Schema,
+        chat_id: int | None,
+        zone: Any,
+    ) -> _MessageStatsAccumulator:
+        select = self._logical_message_select(schema)
+
+        def chat_col(name: str, fallback: str = "''") -> str:
+            return f"c.{name}" if name in schema.chat else fallback
+
+        filters = [self._logical_non_reaction_filter(schema)]
+        params: list[Any] = []
+        if chat_id is not None:
+            filters.append("cmj.chat_id = ?")
+            params.append(chat_id)
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT
+                {select},
+                {chat_col("chat_identifier")} AS stats_chat_identifier,
+                {chat_col("display_name")} AS stats_chat_display_name,
+                {chat_col("service_name")} AS stats_chat_service
+            FROM message m
+            JOIN (SELECT DISTINCT chat_id, message_id FROM chat_message_join) cmj
+              ON cmj.message_id = m.ROWID
+            JOIN chat c ON c.ROWID = cmj.chat_id
+            LEFT JOIN handle h ON h.ROWID = m.handle_id
+            WHERE {" AND ".join(f"({item})" for item in filters)}
+            ORDER BY m.ROWID ASC, cmj.chat_id ASC
+            """,
+            params,
+        )
+        accumulator = _MessageStatsAccumulator()
+        last_by_chat: dict[int, _LogicalMessage] = {}
+        current_rowid: int | None = None
+        global_message: _LogicalMessage | None = None
+        # Row ordering keeps every chat association for one physical message
+        # contiguous, so global dedupe needs only the current group.
+        for row in rows:
+            message = self._logical_message_from_row(row)
+            identifier = str(row["stats_chat_identifier"] or "")
+            name = str(row["stats_chat_display_name"] or identifier or "unknown")
+            service = str(row["stats_chat_service"] or "unknown")
+            if current_rowid is not None and message.rowid != current_rowid:
+                if global_message is not None:
+                    accumulator.add_global(global_message, zone)
+                global_message = None
+            current_rowid = message.rowid
+
+            previous = last_by_chat.get(message.chat_id)
+            if previous is not None and self._can_coalesce_url_preview(previous, message):
+                continue
+            last_by_chat[message.chat_id] = message
+            accumulator.add_chat(message, (identifier, name, service))
+            if global_message is None:
+                global_message = message
+        if global_message is not None:
+            accumulator.add_global(global_message, zone)
+        return accumulator
+
+    def _build_message_stats(
+        self,
+        accumulator: _MessageStatsAccumulator,
+        time_zone_name: str,
+        media: MediaStats | None,
+    ) -> MessageStats:
+        chats = []
+        for scoped_chat_id, count in accumulator.chat_counts.items():
+            identifier, name, service = accumulator.chat_dimensions.get(
+                scoped_chat_id,
+                ("", "unknown", "unknown"),
+            )
+            chats.append(
+                ChatMessageStats(
+                    chat_id=scoped_chat_id,
+                    identifier=identifier,
+                    name=name,
+                    service=service,
+                    message_count=count,
+                )
+            )
+        chats.sort(key=lambda item: (-item.message_count, item.chat_id))
+        senders = sorted(
+            (
+                SenderMessageStats(handle=handle, message_count=count)
+                for handle, count in accumulator.sender_counts.items()
+            ),
+            key=lambda item: (-item.message_count, item.handle),
+        )
+        services = sorted(
+            (
+                ServiceMessageStats(service=service, message_count=count)
+                for service, count in accumulator.service_counts.items()
+            ),
+            key=lambda item: (-item.message_count, item.service),
+        )
+        dates = [
+            DateMessageStats(date=date, message_count=accumulator.date_counts[date])
+            for date in sorted(accumulator.date_counts)
+        ]
+        return MessageStats(
+            total_messages=accumulator.total_messages,
+            sent_messages=accumulator.sent_messages,
+            received_messages=accumulator.received_messages,
+            time_zone=time_zone_name,
+            chats=chats,
+            senders=senders,
+            services=services,
+            dates=dates,
+            media=media,
+        )
+
+    def _stats_media(
+        self,
+        conn: sqlite3.Connection,
+        schema: _Schema,
+        chat_id: int | None,
+    ) -> MediaStats:
+        required = ("attachment", "message_attachment_join")
+        for table in required:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+                (table,),
+            ).fetchone()
+            if exists is None:
+                raise MessageStatsError(
+                    "media statistics are unavailable because attachment tables are missing"
+                )
+
+        attachment_columns = self._table_columns(conn, "attachment")
+
+        def attachment_col(name: str, fallback: str = "''") -> str:
+            return f"a.{name}" if name in attachment_columns else fallback
+
+        def chat_col(name: str, fallback: str = "''") -> str:
+            return f"c.{name}" if name in schema.chat else fallback
+
+        filters = [self._logical_non_reaction_filter(schema)]
+        params: list[Any] = []
+        if chat_id is not None:
+            filters.append("cmj.chat_id = ?")
+            params.append(chat_id)
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT
+                a.ROWID AS attachment_id,
+                cmj.chat_id AS media_chat_id,
+                {chat_col("chat_identifier")} AS media_chat_identifier,
+                {chat_col("display_name")} AS media_chat_display_name,
+                {attachment_col("uti")} AS media_uti,
+                {attachment_col("mime_type")} AS media_mime_type,
+                {attachment_col("total_bytes", "0")} AS media_total_bytes
+            FROM attachment a
+            JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
+            JOIN message m ON m.ROWID = maj.message_id
+            JOIN (SELECT DISTINCT chat_id, message_id FROM chat_message_join) cmj
+              ON cmj.message_id = m.ROWID
+            JOIN chat c ON c.ROWID = cmj.chat_id
+            WHERE {" AND ".join(f"({item})" for item in filters)}
+            ORDER BY a.ROWID ASC, cmj.chat_id ASC
+            """,
+            params,
+        )
+
+        total_attachments = 0
+        aggregate_bytes = 0
+        current_attachment_id: int | None = None
+        type_counts: dict[tuple[str, str], tuple[int, int]] = {}
+        chat_totals: dict[int, tuple[str, str, int, int]] = {}
+        # DISTINCT removes duplicate join rows; ordering makes global attachment
+        # dedupe a constant-memory comparison while retaining per-chat totals.
+        for row in rows:
+            attachment_id = int(row["attachment_id"])
+            scoped_chat_id = int(row["media_chat_id"])
+            uti = str(row["media_uti"] or "").strip() or "unknown"
+            mime_type = str(row["media_mime_type"] or "").strip() or "unknown"
+            total_bytes = max(int(row["media_total_bytes"] or 0), 0)
+            if attachment_id != current_attachment_id:
+                current_attachment_id = attachment_id
+                total_attachments += 1
+                aggregate_bytes += total_bytes
+                count, byte_count = type_counts.get((uti, mime_type), (0, 0))
+                type_counts[(uti, mime_type)] = (count + 1, byte_count + total_bytes)
+            identifier = str(row["media_chat_identifier"] or "")
+            name = str(row["media_chat_display_name"] or identifier or "unknown")
+            _, _, count, byte_count = chat_totals.get(scoped_chat_id, (identifier, name, 0, 0))
+            chat_totals[scoped_chat_id] = (identifier, name, count + 1, byte_count + total_bytes)
+
+        types = [
+            MediaTypeStats(
+                uti=uti,
+                mime_type=mime_type,
+                attachment_count=count,
+                total_bytes=byte_count,
+            )
+            for (uti, mime_type), (count, byte_count) in type_counts.items()
+        ]
+        types.sort(key=lambda item: (-item.attachment_count, -item.total_bytes, item.uti, item.mime_type))
+
+        chats = [
+            ChatMediaStats(
+                chat_id=scoped_chat_id,
+                identifier=identifier,
+                name=name,
+                attachment_count=count,
+                total_bytes=byte_count,
+            )
+            for scoped_chat_id, (identifier, name, count, byte_count) in chat_totals.items()
+        ]
+        chats.sort(key=lambda item: (-item.attachment_count, -item.total_bytes, item.chat_id))
+        return MediaStats(
+            total_attachments=total_attachments,
+            total_bytes=aggregate_bytes,
+            types=types,
+            chats=chats,
+        )
+
     def _contacts_paths(
         self,
         contacts_db_paths: list[str | Path] | None,
@@ -673,6 +1077,7 @@ class IMessageClient:
             m.date AS message_date,
             m.is_from_me AS is_from_me,
             {col("is_read", "NULL")} AS is_read,
+            {col("date_read", "NULL")} AS date_read,
             m.service AS message_service,
             {col("is_sent", "NULL")} AS is_sent,
             {col("is_delivered", "NULL")} AS is_delivered,
@@ -691,11 +1096,215 @@ class IMessageClient:
         """
 
     def _non_reaction_filter(self, schema: _Schema) -> str:
+        return self._preview_predecessor_filter(schema)
+
+    def _preview_predecessor_filter(self, schema: _Schema, alias: str = "m") -> str:
         if "associated_message_type" not in schema.message:
             return "1 = 1"
-        return "(m.associated_message_type IS NULL OR m.associated_message_type < 2000 OR m.associated_message_type > 3006)"
+        column = f"{alias}.associated_message_type"
+        return f"({column} IS NULL OR {column} < 2000 OR {column} > 3006)"
 
-    def _row_to_chat(self, conn: sqlite3.Connection, row: sqlite3.Row) -> Chat:
+    def _logical_non_reaction_filter(self, schema: _Schema, alias: str = "m") -> str:
+        if "associated_message_type" not in schema.message:
+            return "1 = 1"
+        column = f"{alias}.associated_message_type"
+        return (
+            f"({column} IS NULL OR "
+            f"({column} NOT BETWEEN 2000 AND 2006 AND {column} NOT BETWEEN 3000 AND 3006))"
+        )
+
+    def _logical_message_select(
+        self,
+        schema: _Schema,
+        message_alias: str = "m",
+        chat_alias: str = "cmj",
+        handle_alias: str = "h",
+        prefix: str = "logical",
+    ) -> str:
+        def col(name: str, fallback: str = "NULL") -> str:
+            return f"{message_alias}.{name}" if name in schema.message else fallback
+
+        return f"""
+            {message_alias}.ROWID AS {prefix}_message_id,
+            {chat_alias}.chat_id AS {prefix}_chat_id,
+            {col("handle_id")} AS {prefix}_handle_id,
+            {handle_alias}.id AS {prefix}_sender,
+            {col("text", "''")} AS {prefix}_text,
+            {col("subject")} AS {prefix}_subject,
+            {col("attributedBody")} AS {prefix}_attributed_body,
+            {col("date", "0")} AS {prefix}_date,
+            {col("is_from_me", "0")} AS {prefix}_is_from_me,
+            {col("service", "''")} AS {prefix}_service,
+            {col("destination_caller_id", "''")} AS {prefix}_destination_caller_id,
+            {col("balloon_bundle_id")} AS {prefix}_balloon_bundle_id,
+            {col("is_read")} AS {prefix}_is_read
+        """
+
+    def _logical_message_from_row(self, row: sqlite3.Row, prefix: str = "logical") -> _LogicalMessage:
+        raw_text = row[f"{prefix}_text"] or row[f"{prefix}_subject"] or ""
+        text = raw_text or core._extract_attributed_body_text(row[f"{prefix}_attributed_body"]) or ""
+        sender = str(row[f"{prefix}_sender"] or row[f"{prefix}_destination_caller_id"] or "")
+        return _LogicalMessage(
+            rowid=int(row[f"{prefix}_message_id"]),
+            chat_id=int(row[f"{prefix}_chat_id"]),
+            sender=sender,
+            text=str(text),
+            created_at=self._apple_to_datetime(row[f"{prefix}_date"]),
+            is_from_me=bool(row[f"{prefix}_is_from_me"]),
+            service=str(row[f"{prefix}_service"] or "unknown"),
+            handle_id=(
+                int(row[f"{prefix}_handle_id"])
+                if row[f"{prefix}_handle_id"] is not None
+                else None
+            ),
+            balloon_bundle_id=(
+                str(row[f"{prefix}_balloon_bundle_id"])
+                if row[f"{prefix}_balloon_bundle_id"]
+                else None
+            ),
+            is_read=(
+                bool(row[f"{prefix}_is_read"])
+                if row[f"{prefix}_is_read"] is not None
+                else None
+            ),
+        )
+
+    def _can_coalesce_url_preview(self, text_message: _LogicalMessage, preview: _LogicalMessage) -> bool:
+        if preview.balloon_bundle_id != _URL_PREVIEW_BALLOON_BUNDLE_ID:
+            return False
+        if text_message.balloon_bundle_id is not None or text_message.chat_id != preview.chat_id:
+            return False
+        if text_message.is_from_me != preview.is_from_me or text_message.sender != preview.sender:
+            return False
+        if (
+            text_message.handle_id is not None
+            and preview.handle_id is not None
+            and text_message.handle_id != preview.handle_id
+        ):
+            return False
+        if preview.rowid <= text_message.rowid or text_message.created_at is None or preview.created_at is None:
+            return False
+        delta = (preview.created_at - text_message.created_at).total_seconds()
+        if delta < 0 or delta > 5:
+            return False
+        preview_text = preview.text.strip()
+        if not preview_text.casefold().startswith(("http://", "https://", "www.")):
+            return False
+        folded_text = text_message.text.casefold()
+        candidates = {preview_text, preview_text.strip("/")}
+        return any(candidate and candidate.casefold() in folded_text for candidate in candidates)
+
+    def _unread_counts(
+        self,
+        conn: sqlite3.Connection,
+        schema: _Schema,
+        chat_ids: list[int],
+    ) -> dict[int, int]:
+        unique_chat_ids = list(dict.fromkeys(chat_ids))
+        if "is_read" not in schema.message or not unique_chat_ids:
+            return {}
+        result = {chat_id: 0 for chat_id in unique_chat_ids}
+        logical_ids: dict[int, set[int]] = {chat_id: set() for chat_id in unique_chat_ids}
+        for start in range(0, len(unique_chat_ids), 500):
+            chunk = unique_chat_ids[start:start + 500]
+            placeholders = ", ".join("?" for _ in chunk)
+            candidate_predicate = "m.is_read = 0"
+            candidate_params: list[Any] = [*chunk]
+            if "balloon_bundle_id" in schema.message:
+                candidate_predicate = "(m.is_read = 0 OR m.balloon_bundle_id = ?)"
+                candidate_params.append(_URL_PREVIEW_BALLOON_BUNDLE_ID)
+            message_select = self._logical_message_select(
+                schema,
+                message_alias="m",
+                chat_alias="candidate",
+                handle_alias="h",
+                prefix="logical",
+            )
+            previous_select = self._logical_message_select(
+                schema,
+                message_alias="previous_m",
+                chat_alias="candidate",
+                handle_alias="previous_h",
+                prefix="previous",
+            )
+            rows = conn.execute(
+                f"""
+                WITH unread_candidates AS (
+                    SELECT DISTINCT cmj.chat_id, m.ROWID AS message_id
+                    FROM message m
+                    JOIN (SELECT DISTINCT chat_id, message_id FROM chat_message_join) cmj
+                      ON cmj.message_id = m.ROWID
+                    WHERE cmj.chat_id IN ({placeholders})
+                      AND m.is_from_me = 0
+                      AND {candidate_predicate}
+                ), candidate_rows AS (
+                    SELECT candidate.chat_id, candidate.message_id,
+                           (
+                               SELECT previous_m.ROWID
+                               FROM message previous_m
+                               JOIN (
+                                   SELECT DISTINCT chat_id, message_id
+                                   FROM chat_message_join
+                               ) previous_cmj ON previous_cmj.message_id = previous_m.ROWID
+                               WHERE previous_cmj.chat_id = candidate.chat_id
+                                 AND previous_m.ROWID < candidate.message_id
+                                 AND ({self._preview_predecessor_filter(schema, alias="previous_m")})
+                               ORDER BY previous_m.ROWID DESC
+                               LIMIT 1
+                           ) AS previous_id
+                    FROM unread_candidates candidate
+                )
+                SELECT {message_select}, {previous_select}
+                FROM candidate_rows candidate
+                JOIN message m ON m.ROWID = candidate.message_id
+                LEFT JOIN handle h ON h.ROWID = m.handle_id
+                LEFT JOIN message previous_m ON previous_m.ROWID = candidate.previous_id
+                LEFT JOIN handle previous_h ON previous_h.ROWID = previous_m.handle_id
+                ORDER BY candidate.chat_id ASC, m.ROWID ASC
+                """,
+                candidate_params,
+            )
+            preview_state: dict[int, tuple[int, _LogicalMessage | None]] = {}
+            for row in rows:
+                message = self._logical_message_from_row(row)
+                logical_id = message.rowid
+                if (
+                    message.balloon_bundle_id == _URL_PREVIEW_BALLOON_BUNDLE_ID
+                    and row["previous_message_id"] is not None
+                ):
+                    previous = self._logical_message_from_row(row, prefix="previous")
+                    resolved_base: _LogicalMessage | None = None
+                    if self._can_coalesce_url_preview(previous, message):
+                        resolved_base = previous
+                    elif previous.balloon_bundle_id == _URL_PREVIEW_BALLOON_BUNDLE_ID:
+                        carried = preview_state.get(message.chat_id)
+                        if (
+                            carried is not None
+                            and carried[0] == previous.rowid
+                            and carried[1] is not None
+                            and self._can_coalesce_url_preview(carried[1], message)
+                        ):
+                            resolved_base = carried[1]
+                    preview_state[message.chat_id] = (message.rowid, resolved_base)
+                    if resolved_base is not None:
+                        if resolved_base.is_read is not False:
+                            continue
+                        logical_id = resolved_base.rowid
+                    elif message.is_read is not False:
+                        continue
+                elif message.is_read is not False:
+                    continue
+                logical_ids[message.chat_id].add(logical_id)
+        for chat_id, rowids in logical_ids.items():
+            result[chat_id] = len(rowids)
+        return result
+
+    def _row_to_chat(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        unread_count: int | None = None,
+    ) -> Chat:
         participants = self._participants(conn, int(row["chat_id"]))
         contacts = [contact for handle in participants if (contact := self.resolve_contact(handle))] if self.enrich_contacts else []
         contact_name = contacts[0].display_name if contacts else None
@@ -719,6 +1328,7 @@ class IMessageClient:
             account_id=self._row_value(row, "account_id"),
             account_login=self._row_value(row, "account_login"),
             last_addressed_handle=self._row_value(row, "last_addressed_handle"),
+            unread_count=unread_count,
         )
 
     def _rows_to_messages(
@@ -734,7 +1344,8 @@ class IMessageClient:
         messages = []
         for row in rows:
             text = row["text"] or core._extract_attributed_body_text(row["attributed_body"]) or ""
-            sender = self._row_value(row, "sender") if not bool(row["is_from_me"]) else self._row_value(row, "destination_caller_id") or "me"
+            is_from_me = bool(row["is_from_me"])
+            sender = self._row_value(row, "sender") if not is_from_me else self._row_value(row, "destination_caller_id") or "me"
             contact = self.resolve_contact(sender or "") if self.enrich_contacts and sender != "me" else None
             participants = self._participants(conn, int(row["chat_id"])) if row["chat_id"] is not None else []
             associated_type = row["associated_message_type"]
@@ -748,7 +1359,7 @@ class IMessageClient:
                     sender=sender,
                     text=text,
                     created_at=self._apple_to_datetime(row["message_date"]),
-                    is_from_me=bool(row["is_from_me"]),
+                    is_from_me=is_from_me,
                     service=self._row_value(row, "message_service") or self._row_value(row, "chat_service"),
                     handle_id=int(row["handle_rowid"]) if row["handle_rowid"] is not None else None,
                     chat_identifier=self._row_value(row, "chat_identifier"),
@@ -758,7 +1369,12 @@ class IMessageClient:
                     is_group=self._is_group(self._row_value(row, "chat_identifier"), self._row_value(row, "chat_guid")),
                     sender_name=contact.display_name if contact else None,
                     contact=contact,
-                    is_read=bool(row["is_read"]) if row["is_read"] is not None else None,
+                    is_read=bool(row["is_read"]) if not is_from_me and row["is_read"] is not None else None,
+                    date_read=(
+                        self._positive_apple_to_datetime(row["date_read"])
+                        if not is_from_me and bool(row["is_read"])
+                        else None
+                    ),
                     reply_to_guid=core._normalize_associated_guid(self._row_value(row, "associated_message_guid")),
                     thread_originator_guid=self._row_value(row, "thread_originator_guid"),
                     destination_caller_id=self._row_value(row, "destination_caller_id"),
@@ -1467,6 +2083,11 @@ end run
     def _apple_to_datetime(self, value: Any) -> datetime | None:
         iso = core._apple_timestamp_to_iso(value)
         return self._parse_optional_datetime(iso)
+
+    def _positive_apple_to_datetime(self, value: Any) -> datetime | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            return None
+        return self._apple_to_datetime(value)
 
     def _parse_optional_datetime(self, value: Any) -> datetime | None:
         if not value:
