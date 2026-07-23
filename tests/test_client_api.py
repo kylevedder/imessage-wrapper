@@ -408,6 +408,55 @@ def test_client_reads_messages_and_contacts_with_timestamps(tmp_path):
     assert contacts[0].modified_at.day == 2
 
 
+def test_client_sorts_contacts_by_most_recently_added(tmp_path):
+    messages_db = tmp_path / "chat.db"
+    contacts_db = tmp_path / "AddressBook-v22.abcddb"
+    make_messages_db(messages_db)
+    make_contacts_db(contacts_db)
+    conn = sqlite3.connect(contacts_db)
+    try:
+        newer = apple_seconds(datetime(2026, 5, 1, tzinfo=timezone.utc))
+        conn.execute(
+            """
+            INSERT INTO ZABCDRECORD
+            VALUES (2, 'Zoe Recent', 'Zoe', NULL, 'Recent', NULL, NULL,
+                    'Zoe', 'Recent', ?, ?)
+            """,
+            (newer, newer),
+        )
+        conn.execute(
+            """
+            INSERT INTO ZABCDRECORD
+            VALUES (3, 'Aaron Undated', 'Aaron', NULL, 'Undated', NULL, NULL,
+                    'Aaron', 'Undated', NULL, NULL)
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[contacts_db])
+
+    assert [contact.display_name for contact in client.contacts(sort="recent")] == [
+        "Zoe Recent",
+        "Alex Example",
+        "Aaron Undated",
+    ]
+    assert [contact.display_name for contact in client.contacts(sort="recent", limit=1, offset=1)] == [
+        "Alex Example"
+    ]
+    assert [contact.display_name for contact in client.iter_contacts(page_size=1, sort="recent")] == [
+        "Zoe Recent",
+        "Alex Example",
+        "Aaron Undated",
+    ]
+    assert [contact.display_name for contact in client.contacts()] == [
+        "Alex Example",
+        "Zoe Recent",
+        "Aaron Undated",
+    ]
+
+
 def test_client_rejects_invalid_search_and_contact_bounds(tmp_path):
     messages_db = tmp_path / "chat.db"
     contacts_db = tmp_path / "AddressBook-v22.abcddb"
@@ -424,6 +473,8 @@ def test_client_rejects_invalid_search_and_contact_bounds(tmp_path):
         client.search_contacts("alex", limit=0)
     with pytest.raises(ValueError, match="offset must be >= 0"):
         client.contacts(offset=-1)
+    with pytest.raises(ValueError, match="sort must be 'name' or 'recent'"):
+        client.contacts(sort="oldest")
 
 
 def test_client_reads_attributed_body_when_text_column_is_empty(tmp_path, monkeypatch):

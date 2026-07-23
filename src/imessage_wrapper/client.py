@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -573,18 +573,39 @@ class IMessageClient:
         """Alias for :meth:`stats` using a descriptive Python API name."""
         return self.stats(chat_id=chat_id, include_media=include_media, time_zone=time_zone)
 
-    def contacts(self, limit: int = 5000, offset: int = 0) -> list[Contact]:
+    def contacts(
+        self,
+        limit: int = 5000,
+        offset: int = 0,
+        sort: Literal["name", "recent"] = "name",
+    ) -> list[Contact]:
         if limit < 1:
             raise ValueError("limit must be >= 1")
         if offset < 0:
             raise ValueError("offset must be >= 0")
+        if sort not in {"name", "recent"}:
+            raise ValueError("sort must be 'name' or 'recent'")
         all_contacts = self._load_contacts()
+        if sort == "recent":
+            all_contacts = sorted(
+                all_contacts,
+                key=lambda contact: (
+                    contact.created_at is None,
+                    -(contact.created_at.timestamp() if contact.created_at else 0.0),
+                    contact.display_name.casefold(),
+                    contact.id,
+                ),
+            )
         return all_contacts[offset:offset + limit]
 
-    def iter_contacts(self, page_size: int = 5000) -> Iterator[Contact]:
+    def iter_contacts(
+        self,
+        page_size: int = 5000,
+        sort: Literal["name", "recent"] = "name",
+    ) -> Iterator[Contact]:
         offset = 0
         while True:
-            batch = self.contacts(limit=page_size, offset=offset)
+            batch = self.contacts(limit=page_size, offset=offset, sort=sort)
             if not batch:
                 return
             yield from batch
