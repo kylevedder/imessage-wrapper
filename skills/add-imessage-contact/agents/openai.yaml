@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add iMessage Contact"
+  short_description: "Create a macOS contact for iMessage use."
+  default_prompt: "Use $add-imessage-contact to preview and create a macOS contact for iMessage use."

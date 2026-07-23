@@ -33,6 +33,23 @@ After changing dependencies in `pyproject.toml`, refresh the lockfile with:
 uv lock
 ```
 
+## Codex skills
+
+The reusable iMessage skills live under `skills/` in this repository. Link them
+into Codex's global skill directory with:
+
+```bash
+./scripts/setup_skill_symlinks.sh
+```
+
+The setup is idempotent. Existing paths with the same skill names are moved to
+`$CODEX_HOME/skill-backups/` (or `~/.codex/skill-backups/`) before the symlinks
+are created. Verify an installation without changing it with:
+
+```bash
+./scripts/setup_skill_symlinks.sh --check
+```
+
 ## Usage
 
 ```python
