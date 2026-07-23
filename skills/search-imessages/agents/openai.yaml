@@ -1,0 +1,4 @@
+interface:
+  display_name: "Search iMessages"
+  short_description: "Search local iMessage history safely."
+  default_prompt: "Use $search-imessages to find relevant messages, plans, commitments, people, dates, or keywords."

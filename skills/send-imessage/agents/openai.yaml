@@ -1,0 +1,4 @@
+interface:
+  display_name: "Send iMessage"
+  short_description: "Preview and send iMessage or SMS safely."
+  default_prompt: "Use $send-imessage to preview or send a recipient-ready iMessage or SMS."

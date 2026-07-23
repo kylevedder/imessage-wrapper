@@ -1,0 +1,4 @@
+interface:
+  display_name: "Search iMessage Contacts"
+  short_description: "Search local Contacts for iMessage use."
+  default_prompt: "Use $search-imessage-contacts to find a contact by name, phone number, email, or organization."
