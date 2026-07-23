@@ -65,4 +65,5 @@ jobs:
           cd "$test_dir"
           uv venv --python 3.13
           uv pip install pytest pytest-asyncio "$GITHUB_WORKSPACE"/dist/*.whl
-          .venv/bin/python -m pytest -q tests
+          # The symlink installer is repository tooling, not part of the wheel.
+          .venv/bin/python -m pytest -q tests --ignore=tests/test_setup_skill_symlinks.py
