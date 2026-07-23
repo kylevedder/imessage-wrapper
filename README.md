@@ -48,6 +48,9 @@ unread_chats = client.chats(unread_only=True)
 stats = client.stats(time_zone="America/Los_Angeles", include_media=True)
 print(stats.total_messages, stats.media.total_bytes if stats.media else 0)
 client.send(chat_id=chat.id, text="hello")
+
+# Contacts are alphabetical by default; request newest-added first when needed.
+recent_contacts = client.contacts(limit=25, sort="recent")
 ```
 
 When supported by the local Messages schema, chats include logical inbound
