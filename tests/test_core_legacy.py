@@ -1332,6 +1332,7 @@ def test_applescript_sender_uses_chat_guid_for_group_chat_and_verifies_send(tmp_
     result = sender._send_sync("b99df106dc964e2e9e5439c4dc7396d4", "hello group")
 
     assert result["sent"] is True
+    assert result["submitted"] is True
     assert result["recipient"] == "b99df106dc964e2e9e5439c4dc7396d4"
 
 
@@ -1610,8 +1611,10 @@ def test_applescript_sender_returns_unverified_if_group_send_never_appears(tmp_p
 
     result = sender._send_sync("b99df106dc964e2e9e5439c4dc7396d4", "hello group")
 
-    assert result["sent"] is True
+    assert result["submitted"] is True
+    assert result["sent"] is False
     assert result["verified"] is False
+    assert result["result"] == "submitted"
 
 
 def test_applescript_sender_direct_send_still_uses_recipient_handle(tmp_path, monkeypatch):
@@ -1644,6 +1647,202 @@ def test_applescript_sender_direct_send_still_uses_recipient_handle(tmp_path, mo
     result = sender._send_sync("+15550100001", "hello direct")
 
     assert result["sent"] is True
+
+
+@pytest.mark.parametrize("use_chat", [False, True])
+def test_applescript_sender_does_not_retry_payload_after_send_error(tmp_path, monkeypatch, use_chat):
+    sender = AppleScriptIMessageSender(db_path=tmp_path / "unused.db")
+    chat = {"guid": "any;+;synthetic-group", "chat_identifier": "synthetic-group"}
+    monkeypatch.setattr(sender, "_resolve_group_chat", lambda _: chat if use_chat else None)
+    monkeypatch.setattr(sender, "_resolve_direct_chat", lambda _: None)
+    for name in (
+        "_latest_chat_message_rowid", "_latest_chat_attachment_rowid",
+        "_latest_direct_message_rowid", "_latest_direct_attachment_rowid",
+    ):
+        monkeypatch.setattr(sender, name, lambda _: 0)
+    monkeypatch.setattr(sender, "_find_recent_duplicate_attachment", lambda *args: None)
+    monkeypatch.setattr(sender, "_stage_send_attachments", lambda paths: paths)
+    monkeypatch.setattr(sender, "_wait_for_send", lambda *args: False)
+    calls = []
+
+    def fail_after_dispatch(cmd, *, input, **kwargs):
+        calls.append(cmd)
+        lookup_block = input.split("try\n", 1)[1].split("end try", 1)[0]
+        assert "sendPayload" not in lookup_block
+        assert " to get " in lookup_block
+        assert input.count("my sendPayload(") == 1
+        assert input.index("my sendPayload(") > input.index("end try")
+        raise subprocess.CalledProcessError(1, cmd, stderr="send failed after dispatch")
+
+    monkeypatch.setattr(core.subprocess, "run", fail_after_dispatch)
+    result = sender._send_sync("+15550100001", "only dispatch once")
+    assert len(calls) == 1
+    assert result["submitted"] is None
+    assert result["sent"] is False
+    assert result["verified"] is False
+    assert result["result"] == "unconfirmed"
+    assert "send failed after dispatch" in result["error"]
+
+
+def _make_send_status_db(db_path, attachment_path):
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT, uncanonicalized_id TEXT);
+            CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, guid TEXT, chat_identifier TEXT);
+            CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
+            CREATE TABLE message (
+                ROWID INTEGER PRIMARY KEY, text TEXT, subject TEXT, attributedBody BLOB,
+                is_from_me INTEGER, handle_id INTEGER, service TEXT, is_sent INTEGER,
+                is_delivered INTEGER, date_delivered INTEGER, is_finished INTEGER, error INTEGER
+            );
+            CREATE TABLE attachment (
+                ROWID INTEGER PRIMARY KEY, guid TEXT, filename TEXT, mime_type TEXT,
+                total_bytes INTEGER, transfer_name TEXT, uti TEXT, created_date INTEGER
+            );
+            CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);
+            INSERT INTO handle VALUES (1, '+15550100001', '+15550100001');
+            INSERT INTO chat VALUES (1, 'synthetic-chat', '+15550100001');
+            INSERT INTO message VALUES (1, 'hello', NULL, NULL, 1, 1, 'iMessage', 0, 0, 0, 1, 0);
+            INSERT INTO chat_message_join VALUES (1, 1);
+            INSERT INTO message_attachment_join VALUES (1, 1);
+            """
+        )
+        conn.execute(
+            "INSERT INTO attachment VALUES (1, 'synthetic-attachment', ?, 'image/png', 7, 'photo.png', 'public.png', 0)",
+            (str(attachment_path),),
+        )
+
+
+@pytest.mark.parametrize("target_kind", ["direct", "group"])
+@pytest.mark.parametrize("attachment_only", [False, True])
+@pytest.mark.parametrize(
+    "service,is_sent,is_delivered,date_delivered,error,expected",
+    [
+        ("iMessage", 0, 0, 0, 0, False),
+        ("iMessage", 1, 0, 0, 0, False),
+        ("iMessage", 1, 1, 0, 0, True),
+        ("RCS", 1, 0, 123, 0, True),
+        ("SMS", 0, 0, 0, 0, False),
+        ("SMS", 1, 0, 0, 0, True),
+        ("SMS", 1, 0, 0, 42, False),
+    ],
+)
+def test_applescript_sender_requires_confirmed_modern_rows(
+    tmp_path, target_kind, attachment_only, service, is_sent, is_delivered, date_delivered, error, expected
+):
+    db_path = tmp_path / "chat.db"
+    attachment = tmp_path / "photo.png"
+    attachment.write_bytes(b"fakepng")
+    _make_send_status_db(db_path, attachment)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE message SET service = ?, is_sent = ?, is_delivered = ?, date_delivered = ?, error = ?",
+            (service, is_sent, is_delivered, date_delivered, error),
+        )
+    sender = AppleScriptIMessageSender(db_path=db_path)
+    target = "synthetic-chat" if target_kind == "group" else "+15550100001"
+    assert sender._send_visible(
+        target_kind, target, "" if attachment_only else "hello", 0, 0,
+        [str(attachment)] if attachment_only else [],
+    ) is expected
+
+
+def test_applescript_sender_waits_for_finished_row_to_be_delivered(tmp_path, monkeypatch):
+    db_path = tmp_path / "chat.db"
+    _make_send_status_db(db_path, tmp_path / "unused.png")
+    sender = AppleScriptIMessageSender(db_path=db_path)
+    updates = []
+
+    def update_status(_):
+        updates.append(True)
+        with sqlite3.connect(db_path) as conn:
+            if len(updates) == 1:
+                conn.execute("UPDATE message SET is_sent = 1")
+            else:
+                conn.execute("UPDATE message SET is_delivered = 1")
+
+    monkeypatch.setattr(core.time, "sleep", update_status)
+    assert sender._wait_for_send("direct", "+15550100001", "hello", 0, 0, []) is True
+    assert len(updates) == 2
+
+
+@pytest.mark.parametrize("automation_error", ["timeout", "nonzero_exit"])
+@pytest.mark.parametrize("queued", [False, True])
+def test_applescript_sender_verifies_after_automation_error_without_retry(
+    tmp_path, monkeypatch, automation_error, queued,
+):
+    db_path = tmp_path / "chat.db"
+    _make_send_status_db(db_path, tmp_path / "unused.png")
+    sender = AppleScriptIMessageSender(
+        db_path=db_path, verification_timeout_seconds=0.02, verification_poll_interval_seconds=0.001,
+    )
+    calls = []
+
+    def dispatch(cmd, **kwargs):
+        calls.append(cmd)
+        if queued:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """INSERT INTO message
+                       SELECT 2, 'queued text', subject, attributedBody, 1, handle_id,
+                              service, 1, 1, 1, 1, 0 FROM message WHERE ROWID = 1"""
+                )
+                conn.execute("INSERT INTO chat_message_join VALUES (1, 2)")
+        if automation_error == "timeout":
+            raise subprocess.TimeoutExpired(cmd, timeout=1)
+        raise subprocess.CalledProcessError(1, cmd, stderr="automation failed after possible dispatch")
+
+    monkeypatch.setattr(core.subprocess, "run", dispatch)
+    result = sender._send_sync("+15550100001", "queued text")
+
+    assert len(calls) == 1
+    assert result["submitted"] is (True if queued else None)
+    assert result["sent"] is queued
+    assert result["verified"] is queued
+    assert result["result"] == ("sent" if queued else "unconfirmed")
+    assert (result["error"] is None) is queued
+
+
+@pytest.mark.parametrize("read_error", [IMessageError, sqlite3.OperationalError, OSError])
+def test_applescript_sender_preserves_submission_when_verification_raises(tmp_path, monkeypatch, read_error):
+    db_path = tmp_path / "chat.db"
+    _make_send_status_db(db_path, tmp_path / "unused.png")
+    sender = AppleScriptIMessageSender(db_path=db_path)
+    calls = []
+
+    def dispatch(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="sent\n", stderr="")
+
+    def verification(*args):
+        raise read_error("synthetic verification failure")
+
+    monkeypatch.setattr(core.subprocess, "run", dispatch)
+    monkeypatch.setattr(sender, "_wait_for_send", verification)
+    result = sender._send_sync("+15550100001", "queued text")
+
+    assert len(calls) == 1
+    assert result["submitted"] is True
+    assert result["sent"] is False
+    assert result["verified"] is False
+    assert result["result"] == "submitted"
+    assert "Verification unavailable" in result["error"]
+
+
+@pytest.mark.parametrize("service", ["iMessageLite", "unknown-service", "", None, "SMS", "MMS"])
+@pytest.mark.parametrize("delivered", [False, True])
+def test_legacy_only_known_sms_mms_services_verify_from_sent_flag(tmp_path, service, delivered):
+    db_path = tmp_path / "chat.db"
+    _make_send_status_db(db_path, tmp_path / "unused.png")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE message SET service = ?, is_sent = 1, is_delivered = ?",
+                     (service, int(delivered)))
+    sender = AppleScriptIMessageSender(db_path=db_path)
+
+    result = sender._send_visible("direct", "+15550100001", "hello", 0, 0, [])
+
+    assert result is (delivered or service in {"SMS", "MMS"})
 
 
 def test_applescript_sender_prefers_existing_direct_chat_for_attachments(tmp_path, monkeypatch):
@@ -1693,7 +1892,7 @@ def test_applescript_sender_prefers_existing_direct_chat_for_attachments(tmp_pat
 
     def fake_run(cmd, input, text, capture_output, timeout, check, env):
         assert cmd == ["osascript", "-", "any;-;+15550100001", "caption", str(image_path.resolve())]
-        assert "set targetChat to chat id targetChatId" in input
+        assert "set targetChat to get chat id targetChatId" in input
         return subprocess.CompletedProcess(cmd, 0, stdout="sent\n", stderr="")
 
     monkeypatch.setattr("imessage_wrapper.core.subprocess.run", fake_run)
@@ -1828,8 +2027,10 @@ def test_applescript_sender_direct_send_returns_unverified_when_verification_is_
 
     result = sender._send_sync("+15550100001", "hello direct")
 
-    assert result["sent"] is True
+    assert result["submitted"] is True
+    assert result["sent"] is False
     assert result["verified"] is False
+    assert result["result"] == "submitted"
 
 
 def test_applescript_sender_blocks_recent_duplicate_attachment(tmp_path, monkeypatch):
@@ -2088,5 +2289,7 @@ def test_applescript_sender_group_image_verification_ignores_older_same_filename
 
     result = sender._send_sync("b99df106dc964e2e9e5439c4dc7396d4", "new caption", [str(image_path)])
 
-    assert result["sent"] is True
+    assert result["submitted"] is True
+    assert result["sent"] is False
     assert result["verified"] is False
+    assert result["result"] == "submitted"

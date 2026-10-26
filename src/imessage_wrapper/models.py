@@ -168,6 +168,12 @@ class SendResult:
     message_guid: str | None = None
     error: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    submitted: bool | None = False
+    requested_service: str | None = None
+    resolved_service: str | None = None
+    resolved_target: str | None = None
+    text_delivery_status: str | None = None
+    status_scope: str = "submission"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

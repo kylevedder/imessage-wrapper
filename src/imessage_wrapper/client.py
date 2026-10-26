@@ -59,6 +59,15 @@ class _SendVerification:
 
 
 @dataclass(frozen=True)
+class _SendRoute:
+    target: str
+    service: str
+    chat: Chat | None = None
+    recipient: str = ""
+    account_id: str | None = None
+
+
+@dataclass(frozen=True)
 class _LogicalMessage:
     rowid: int
     chat_id: int
@@ -656,56 +665,93 @@ class IMessageClient:
         files = self._prepare_files(file_paths or [])
         if not text.strip() and not files:
             raise ValueError("text or file_paths is required")
-        target = self._send_target(to=to, chat_id=chat_id, chat_identifier=chat_identifier, chat_guid=chat_guid)
-        if dry_run:
-            return SendResult(recipient=target, text=text, file_paths=files, dry_run=True, sent=False, verified=False)
         if service not in {"auto", "imessage", "sms"}:
             raise ValueError("service must be 'auto', 'imessage', or 'sms'")
-        use_chat = bool(chat_id or chat_identifier or chat_guid)
-        normalized_target = target if use_chat else self._normalize_outbound_recipient(target, region or self.region)
+        if sum(value is not None for value in (to, chat_id, chat_identifier, chat_guid)) != 1:
+            raise ValueError("Specify exactly one of to, chat_id, chat_identifier, or chat_guid")
+        if self.verification_timeout < 0:
+            raise ValueError("verification_timeout must be >= 0")
+        target = self._send_target(to=to, chat_id=chat_id, chat_identifier=chat_identifier, chat_guid=chat_guid)
+        route = self._resolve_send_route(to, chat_id, chat_identifier, chat_guid, service, region or self.region)
+        if dry_run:
+            return SendResult(recipient=target, text=text, file_paths=files, dry_run=True,
+                              sent=False, verified=False, requested_service=service,
+                              resolved_service=route.service, resolved_target=route.target)
+        use_chat = route.chat is not None
         should_verify = verify if verify is not None else self.verify_sends
         pre_send_rowid = self._latest_message_rowid() if should_verify else 0
         staged_files = self._stage_send_files(files)
         sent_at = datetime.now(timezone.utc)
-        self._run_send_applescript(
-            recipient=normalized_target,
-            text=text,
-            file_paths=staged_files,
-            service=service,
-            use_chat=use_chat,
-        )
-        if chat_identifier or chat_guid:
-            self._raise_if_ghost_row(chat_identifier=chat_identifier, chat_guid=chat_guid, sent_at=sent_at)
+        dispatch_error = None
+        submitted: bool | None = True
+        try:
+            self._run_send_applescript(
+                recipient=route.target,
+                text=text,
+                file_paths=staged_files,
+                service=route.service,
+                use_chat=use_chat,
+                account_id=(route.chat.account_id if route.chat and not route.chat.is_group else route.account_id),
+                direct_recipient=route.recipient,
+            )
+            if chat_identifier or chat_guid:
+                self._raise_if_ghost_row(chat_identifier=chat_identifier, chat_guid=chat_guid, sent_at=sent_at)
+        except (core.IMessageError, sqlite3.Error, OSError) as exc:
+            # A script can time out or raise after a partial dispatch. Never
+            # equate its exit status with a confirmed message failure or retry.
+            submitted = None
+            dispatch_error = f"Automation outcome unknown: {exc}; check Messages before retrying"
         verified = None
         message_id = None
         message_guid = None
-        delivery_status = None
+        delivery_status = "unconfirmed"
         message_service = None
         message_error = None
-        send_error = None
+        send_error = dispatch_error
         if should_verify:
-            found = self._wait_for_sent_message(
-                text=text,
-                chat_id=chat_id,
-                chat_identifier=chat_identifier,
-                chat_guid=chat_guid,
-                recipient=None if use_chat else normalized_target,
-                min_rowid=pre_send_rowid,
-                sent_at=sent_at,
-            )
+            try:
+                found = self._wait_for_sent_message(
+                    text=text,
+                    chat_id=route.chat.id if route.chat else None,
+                    chat_identifier=None,
+                    chat_guid=None,
+                    recipient=None if use_chat else route.recipient,
+                    min_rowid=pre_send_rowid,
+                    sent_at=sent_at,
+                    expected_service=None if route.chat or service == "auto" else route.service,
+                    account_id=route.chat.account_id if route.chat else route.account_id,
+                )
+            except (core.IMessageError, sqlite3.Error, OSError) as exc:
+                found = None
+                dispatch_error = dispatch_error or f"Verification unavailable: {exc}; check Messages before retrying"
             verified = found.verified if found is not None else False if text.strip() else None
             if found is not None:
-                message_id = found.message.id
-                message_guid = found.message.guid
+                if found.delivery_status != "ambiguous":
+                    submitted = True
+                    message_id = found.message.id
+                    message_guid = found.message.guid
                 delivery_status = found.delivery_status
                 message_service = found.message_service
                 message_error = found.message_error
                 send_error = found.error
+            else:
+                send_error = dispatch_error or "No matching text send was verified; do not retry without checking Messages"
+        observed_family = self._service_family(message_service)
+        if service != "auto" and observed_family and observed_family != service:
+            verified = False
+            send_error = f"Requested {service}, but Messages recorded {message_service}; do not retry without checking Messages"
+        text_delivery_status = delivery_status if files and text.strip() else None
+        if files and delivery_status != "failed":
+            # Text and files are separate Messages dispatches. A confirmed text
+            # must not certify attachments whose state we have not checked.
+            verified = False
+            delivery_status = "attachments_unconfirmed"
+            send_error = send_error or "Attachment delivery is unverified; check Messages before retrying"
         return SendResult(
             recipient=target,
             text=text,
             file_paths=files,
-            sent=True,
+            sent=delivery_status in {"sent", "delivered"},
             verified=verified,
             delivery_status=delivery_status,
             message_service=message_service,
@@ -713,6 +759,42 @@ class IMessageClient:
             message_id=message_id,
             message_guid=message_guid,
             error=send_error,
+            submitted=submitted,
+            requested_service=service,
+            resolved_service=route.service,
+            resolved_target=route.target,
+            text_delivery_status=text_delivery_status,
+        )
+
+    def send_status(self, message_id: int) -> SendResult:
+        """Read one outgoing message row, not a multi-part submission; never retry."""
+        if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id < 1:
+            raise ValueError("message_id must be a positive rowid")
+        with self._connect_messages() as conn:
+            schema = self._schema(conn)
+            rows = conn.execute(
+                f"SELECT {self._message_select(schema)} FROM message m "
+                "LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID "
+                "LEFT JOIN handle h ON h.ROWID = m.handle_id "
+                "LEFT JOIN chat c ON c.ROWID = cmj.chat_id "
+                "WHERE m.ROWID = ? AND m.is_from_me = 1 LIMIT 1", (message_id,)
+            ).fetchall()
+            if not rows:
+                raise core.IMessageError(f"Outgoing message not found: {message_id}")
+            message = self._rows_to_messages(conn, rows, include_attachments=True)[0]
+            status = self._classify_send_verification(rows[0], message, schema)
+        has_files = bool(message.attachments)
+        status_name = "attachments_unconfirmed" if has_files and status.delivery_status != "failed" else status.delivery_status
+        return SendResult(
+            recipient=message.chat_identifier or "", submitted=True,
+            sent=status_name in {"sent", "delivered"}, verified=status.verified and not has_files,
+            message_id=message.id, message_guid=message.guid,
+            delivery_status=status_name, message_service=status.message_service,
+            message_error=status.message_error,
+            error=(status.error or "Attachment delivery is unverified") if has_files else status.error,
+            file_paths=[a.path or a.filename or "" for a in message.attachments],
+            text_delivery_status=status.delivery_status if has_files and message.text else None,
+            status_scope="message",
         )
 
     def create_contact(
@@ -1050,7 +1132,10 @@ class IMessageClient:
     def _connect_messages(self) -> sqlite3.Connection:
         if not self.messages_db_path.exists():
             raise core.IMessageError(f"Messages database not found at {self.messages_db_path}")
-        conn = sqlite3.connect(f"file:{self.messages_db_path}?mode=ro", uri=True)
+        try:
+            conn = sqlite3.connect(f"file:{self.messages_db_path}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            raise core.IMessageError(f"Cannot open Messages database read-only: {exc}") from exc
         conn.row_factory = sqlite3.Row
         core._register_lookup_functions(conn)
         return conn
@@ -1665,6 +1750,97 @@ class IMessageClient:
             return to
         raise ValueError("to, chat_id, chat_identifier, or chat_guid is required")
 
+    @staticmethod
+    def _service_family(service: str | None) -> str | None:
+        lowered = (service or "").casefold()
+        if lowered in {"sms", "mms", "rcs"}:
+            return "sms"
+        if lowered in {"imessage", "imessagelite"}:
+            return "imessage"
+        return None
+
+    def _resolve_send_route(
+        self, to: str | None, chat_id: int | None, chat_identifier: str | None,
+        chat_guid: str | None, service: str, region: str,
+    ) -> _SendRoute:
+        if to is None:
+            if chat_identifier is not None:
+                with self._connect_messages() as conn:
+                    count = conn.execute("SELECT COUNT(*) FROM chat WHERE chat_identifier = ?",
+                                         (chat_identifier,)).fetchone()[0]
+                if count > 1:
+                    raise core.IMessageError("Ambiguous chat identifier; specify chat_id or chat_guid")
+            chat = self.chat(chat_id=chat_id, identifier=chat_identifier, guid=chat_guid)
+            if chat is None:
+                raise core.IMessageError("Existing chat not found; no message was submitted")
+            family = self._service_family(chat.service)
+            if service != "auto" and family is None:
+                raise ValueError("Existing chat service is unknown; use to= with an explicit service")
+            if service != "auto" and family != service:
+                raise ValueError("Requested service conflicts with existing chat; use to= for an explicit service")
+            direct = chat.participants[0] if not chat.is_group and len(chat.participants) == 1 else ""
+            return _SendRoute(chat.guid or chat.identifier, family or "auto", chat, direct)
+
+        recipient = self._normalize_outbound_recipient(to, region)
+        if not recipient:
+            raise ValueError("recipient is required")
+        candidates = sorted(self._handle_candidates([recipient]))
+        placeholders = ",".join("?" for _ in candidates)
+        with self._connect_messages() as conn:
+            handle_join = ""
+            handle_match = ""
+            query_values = candidates + candidates
+            if self._table_columns(conn, "chat_handle_join"):
+                handle_join = (" LEFT JOIN chat_handle_join chj ON chj.chat_id = c.ROWID"
+                               " LEFT JOIN handle h ON h.ROWID = chj.handle_id")
+                handle_match = f" OR h.id IN ({placeholders})"
+                query_values += candidates
+            rows = conn.execute(
+                f"SELECT DISTINCT c.ROWID FROM chat c{handle_join} "
+                f"WHERE c.chat_identifier IN ({placeholders}) OR c.guid IN ({placeholders})"
+                f"{handle_match}", query_values,
+            ).fetchall()
+            schema = self._schema(conn)
+            choices: list[tuple[int, Chat, str]] = []
+            for row in rows:
+                chat = self.chat(chat_id=int(row[0]))
+                if chat is None or chat.is_group:
+                    continue
+                participants = {self._normalize_outbound_recipient(p, region) for p in chat.participants}
+                if participants and participants != {recipient}:
+                    continue
+                # Only inbound or confirmed-delivered history may change a known
+                # route. A newly failed/pending iMessage must not displace RCS.
+                trusted = ["m.is_from_me = 0"]
+                if "is_delivered" in schema.message:
+                    trusted.append("m.is_delivered = 1")
+                if "date_delivered" in schema.message:
+                    trusted.append("m.date_delivered > 0")
+                if "is_sent" in schema.message:
+                    trusted.append("(lower(m.service) IN ('sms','mms','rcs') AND m.is_sent = 1)")
+                no_error = "AND COALESCE(m.error, 0) = 0" if "error" in schema.message else ""
+                evidence = conn.execute(
+                    "SELECT m.date, m.service FROM message m "
+                    "JOIN chat_message_join cmj ON cmj.message_id = m.ROWID "
+                    f"WHERE cmj.chat_id = ? AND ({' OR '.join(trusted)}) {no_error} "
+                    "ORDER BY m.date DESC, m.ROWID DESC LIMIT 1", (chat.id,),
+                ).fetchone()
+                family = (self._service_family(evidence["service"] if evidence else None)
+                          or self._service_family(chat.service))
+                if family and (service == "auto" or service == family):
+                    choices.append((int(evidence["date"] or 0) if evidence else 0, chat, family))
+        if not choices:
+            return _SendRoute(recipient, "imessage" if service == "auto" else service, recipient=recipient)
+        choices.sort(key=lambda item: item[0], reverse=True)
+        if len(choices) > 1 and choices[0][0] == choices[1][0]:
+            raise core.IMessageError("Ambiguous direct conversations; specify chat_id before sending")
+        _, chat, family = choices[0]
+        # If historical delivery disagrees with stale chat metadata, use the
+        # selected service directly rather than dispatching to the wrong chat.
+        if self._service_family(chat.service) != family:
+            return _SendRoute(recipient, family, recipient=recipient, account_id=chat.account_id)
+        return _SendRoute(chat.guid or chat.identifier, family, chat, recipient)
+
     def _prepare_files(self, file_paths: list[str]) -> list[str]:
         prepared = []
         for raw in file_paths:
@@ -1698,6 +1874,8 @@ class IMessageClient:
         file_paths: list[str],
         service: str,
         use_chat: bool,
+        account_id: str | None = None,
+        direct_recipient: str = "",
     ) -> None:
         script = """
 on run argv
@@ -1705,22 +1883,48 @@ on run argv
     set outgoingText to item 2 of argv
     set targetServiceName to item 3 of argv
     set useChat to item 4 of argv
+    set directAccountID to item 5 of argv
+    set directRecipient to item 6 of argv
     tell application "Messages"
         if useChat is "1" then
-            set targetRef to chat id targetValue
+            try
+                set targetRef to get chat id targetValue
+            on error lookupMessage number lookupNumber
+                if lookupNumber is not -1728 or directAccountID is "" or directRecipient is "" or targetServiceName is "auto" then
+                    error lookupMessage number lookupNumber
+                end if
+                set targetAccount to get account id directAccountID
+                if targetServiceName is "sms" then
+                    if (service type of targetAccount) is not SMS then error "Stored Messages account does not support carrier messaging" number -1728
+                else
+                    if (service type of targetAccount) is not iMessage then error "Stored Messages account does not support iMessage" number -1728
+                end if
+                try
+                    set targetRef to get buddy directRecipient of targetAccount
+                on error
+                    set targetRef to get participant directRecipient of targetAccount
+                end try
+            end try
         else
-            if targetServiceName is "sms" then
+            if directAccountID is not "" then
+                set targetService to get account id directAccountID
+                if targetServiceName is "sms" then
+                    if (service type of targetService) is not SMS then error "Stored Messages account does not support carrier messaging" number -1728
+                else
+                    if (service type of targetService) is not iMessage then error "Stored Messages account does not support iMessage" number -1728
+                end if
+            else if targetServiceName is "sms" then
                 set targetService to 1st service whose service type = SMS
             else
                 set targetService to 1st service whose service type = iMessage
             end if
             try
-                set targetRef to buddy targetValue of targetService
+                set targetRef to get buddy targetValue of targetService
             on error
-                set targetRef to participant targetValue of targetService
+                set targetRef to get participant targetValue of targetService
             end try
         end if
-        repeat with indexValue from 5 to count of argv
+        repeat with indexValue from 7 to count of argv
             set attachmentPath to item indexValue of argv
             set attachmentFile to (POSIX file attachmentPath) as alias
             send attachmentFile to targetRef
@@ -1735,7 +1939,8 @@ end run
         env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home)}
         try:
             subprocess.run(
-                ["osascript", "-", recipient, text, service, "1" if use_chat else "0", *file_paths],
+                ["osascript", "-", recipient, text, service, "1" if use_chat else "0",
+                 account_id or "", direct_recipient, *file_paths],
                 input=script,
                 text=True,
                 capture_output=True,
@@ -1758,6 +1963,8 @@ end run
         recipient: str | None,
         min_rowid: int,
         sent_at: datetime,
+        expected_service: str | None = None,
+        account_id: str | None = None,
     ) -> _SendVerification | None:
         if not text.strip():
             return None
@@ -1772,6 +1979,14 @@ end run
                 select = self._message_select(schema)
                 where = ["m.is_from_me = 1", "m.date >= ?", "m.ROWID > ?"]
                 params: list[Any] = [start_apple, min_rowid]
+                family = self._service_family(expected_service)
+                if family == "sms":
+                    where.append("lower(m.service) IN ('sms', 'mms', 'rcs')")
+                elif family == "imessage":
+                    where.append("lower(m.service) IN ('imessage', 'imessagelite')")
+                if account_id and "account_id" in schema.chat:
+                    where.append("c.account_id = ?")
+                    params.append(account_id)
                 if chat_id is not None:
                     where.append("cmj.chat_id = ?")
                     params.append(chat_id)
@@ -1799,7 +2014,16 @@ end run
                     params,
                 ).fetchall()
                 messages = self._rows_to_messages(conn, list(rows), include_attachments=False)
-                for row, message in zip(rows, messages):
+                matches = [(row, message) for row, message in zip(rows, messages)
+                           if not (recipient and message.is_group)
+                           and core._normalize_message_text(message.text) == expected_text]
+                if len({message.id for _, message in matches}) > 1:
+                    return _SendVerification(
+                        message=matches[0][1], verified=False, delivery_status="ambiguous",
+                        message_service=None, message_error=None,
+                        error="Multiple new outgoing messages match; inspect Messages before retrying",
+                    )
+                for row, message in matches:
                     if core._normalize_message_text(message.text) == expected_text:
                         verification = self._classify_send_verification(row, message, schema)
                         best_match = verification
@@ -1817,21 +2041,21 @@ end run
         message: Message,
         schema: _Schema,
     ) -> _SendVerification:
-        status_columns = {"is_sent", "is_delivered", "is_finished", "error"}
+        status_columns = {"is_sent", "is_delivered", "date_delivered", "error"}
         message_service = message.service
         message_error = self._optional_int(row["message_error"])
         if not (schema.message & status_columns):
             return _SendVerification(
                 message=message,
-                verified=True,
+                verified=False,
                 delivery_status="recorded",
                 message_service=message_service,
                 message_error=message_error,
+                error="Messages recorded the attempt but this schema has no send status",
             )
 
         is_sent = self._optional_bool(row["is_sent"])
         is_delivered = self._optional_bool(row["is_delivered"])
-        is_finished = self._optional_bool(row["is_finished"])
         date_delivered = self._optional_int(row["date_delivered"])
         if message_error not in {None, 0}:
             return _SendVerification(
@@ -1842,27 +2066,11 @@ end run
                 message_error=message_error,
                 error=f"Messages reported send error {message_error}",
             )
-        if is_finished is True and is_sent is False:
-            return _SendVerification(
-                message=message,
-                verified=False,
-                delivery_status="failed",
-                message_service=message_service,
-                message_error=message_error,
-                error="Messages finished the send without marking it sent",
-            )
-
         service = (message_service or "").casefold()
-        delivered = is_delivered is True or bool(date_delivered)
-        if service in {"imessage", "rcs"}:
-            if delivered:
-                return _SendVerification(
-                    message=message,
-                    verified=True,
-                    delivery_status="delivered",
-                    message_service=message_service,
-                    message_error=message_error,
-                )
+        delivered = is_delivered is True or (date_delivered or 0) > 0
+        if delivered:
+            return _SendVerification(message, True, "delivered", message_service, message_error)
+        if service in {"imessage", "imessagelite", "rcs"}:
             if is_sent is True:
                 return _SendVerification(
                     message=message,
@@ -1882,7 +2090,7 @@ end run
         if is_sent is True:
             return _SendVerification(
                 message=message,
-                verified=True,
+                verified=service in {"sms", "mms"},
                 delivery_status="sent",
                 message_service=message_service,
                 message_error=message_error,
@@ -1904,7 +2112,9 @@ end run
             delivery_status=verification.delivery_status,
             message_service=verification.message_service,
             message_error=verification.message_error,
-            error="Messages did not confirm delivery before verification timed out",
+            error=("Message was sent, but delivery was not confirmed before verification timed out"
+                   if verification.delivery_status == "sent"
+                   else "Messages did not confirm delivery before verification timed out"),
         )
 
     def _optional_bool(self, value: Any) -> bool | None:
@@ -1941,11 +2151,9 @@ end run
             clauses.append(f"c.guid IN ({placeholders})")
         if chat_identifier or recipient:
             clauses.append(f"c.chat_identifier IN ({placeholders})")
-            if "last_addressed_handle" in schema.chat:
-                clauses.append(f"c.last_addressed_handle IN ({placeholders})")
-            clauses.append(f"h.id IN ({placeholders})")
-            if "uncanonicalized_id" in schema.handle:
-                clauses.append(f"h.uncanonicalized_id IN ({placeholders})")
+            # last_addressed_handle is often our own phone number. A handle match
+            # also includes group conversations; neither identifies this send.
+            clauses.append(f"c.guid IN ({placeholders})")
 
         params: list[Any] = []
         for _ in clauses:

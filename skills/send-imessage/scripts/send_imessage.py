@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -11,7 +12,7 @@ WRAPPER_SRC = WRAPPER_ROOT / "src"
 if WRAPPER_SRC.exists():
     sys.path.insert(0, str(WRAPPER_SRC))
 
-from imessage_wrapper import IMessageClient  # noqa: E402
+from imessage_wrapper import IMessageClient, MessageWrapperError, SendResult  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     target.add_argument("--chat-id", type=int, help="Existing chat ROWID.")
     target.add_argument("--chat-identifier", help="Existing chat identifier.")
     target.add_argument("--chat-guid", help="Existing chat guid.")
+    target.add_argument("--status", type=int, help="Read an existing outgoing message row ID without sending.")
 
     body = parser.add_mutually_exclusive_group(required=False)
     body.add_argument("--text", default="", help="Message body.")
@@ -46,6 +48,29 @@ def read_text(args: argparse.Namespace) -> str:
 
 def main() -> int:
     args = parse_args()
+    if args.status is not None:
+        if args.confirm or args.text or args.text_file or args.file:
+            raise SystemExit("--status cannot be combined with a message, files, or --confirm")
+        try:
+            result = IMessageClient(home=args.home).send_status(args.status)
+        except (MessageWrapperError, ValueError, OSError, sqlite3.Error) as exc:
+            result = SendResult(
+                recipient="", submitted=None, verified=False,
+                delivery_status="unconfirmed", status_scope="message",
+                error=f"Unable to inspect message {args.status}: {exc}",
+            )
+        payload = result.to_dict()
+        if args.format == "json":
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(f"message_id: {result.message_id}")
+            print("scope: this message row only, not a multi-part submission")
+            print(f"status: {result.delivery_status} service: {result.message_service}")
+            print(f"sent: {result.sent} delivered: {result.delivery_status == 'delivered'}")
+            print(f"verified: {result.verified} (SMS/MMS verifies sending, not receipt)")
+            if result.error:
+                print(f"error: {result.error}")
+        return 1 if result.delivery_status == "failed" else 0 if result.verified else 2
     text = read_text(args)
     file_paths = [str(Path(path).expanduser()) for path in args.file]
     if not text.strip() and not file_paths:
@@ -72,10 +97,17 @@ def main() -> int:
     if args.format == "json":
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
-        mode = "sent" if args.confirm else "dry-run"
+        mode = (result.delivery_status or "submitted, unconfirmed") if args.confirm else "dry-run"
         print(f"{mode} message")
         print(f"recipient: {payload['recipient']}")
         print(f"sent: {payload['sent']} verified: {payload['verified']}")
+        print(f"route: {payload['resolved_service']} {payload['resolved_target']}")
+        print(f"observed service: {result.message_service} message error: {result.message_error}")
+        print(f"delivered: {result.delivery_status == 'delivered'}")
+        if result.text_delivery_status:
+            print(f"text status only: {result.text_delivery_status}")
+        if result.error:
+            print(f"error: {result.error}")
         if payload.get("message_id"):
             print(f"message_id: {payload['message_id']}")
         if payload.get("message_guid"):
@@ -87,7 +119,9 @@ def main() -> int:
             print("files:")
             for path in file_paths:
                 print(f"- {path}")
-    return 0
+    if not args.confirm:
+        return 0
+    return 1 if result.delivery_status == "failed" else 0 if result.verified else 2
 
 
 if __name__ == "__main__":
