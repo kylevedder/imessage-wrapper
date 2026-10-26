@@ -1841,9 +1841,8 @@ end sendPayload
             return False
         if row["send_is_delivered"] == 1 or (row["send_date_delivered"] or 0) > 0:
             return True
-        if (row["send_service"] or "").casefold() in {"imessage", "rcs"}:
-            return False
-        return row["send_is_sent"] == 1
+        service = (row["send_service"] or "").casefold()
+        return service in {"sms", "mms"} and row["send_is_sent"] == 1
 
 
 def _prepare_image_paths(image_paths: list[str]) -> list[str]:

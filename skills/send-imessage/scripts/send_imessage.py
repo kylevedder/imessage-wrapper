@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -11,7 +12,7 @@ WRAPPER_SRC = WRAPPER_ROOT / "src"
 if WRAPPER_SRC.exists():
     sys.path.insert(0, str(WRAPPER_SRC))
 
-from imessage_wrapper import IMessageClient  # noqa: E402
+from imessage_wrapper import IMessageClient, MessageWrapperError, SendResult  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,7 +51,14 @@ def main() -> int:
     if args.status is not None:
         if args.confirm or args.text or args.text_file or args.file:
             raise SystemExit("--status cannot be combined with a message, files, or --confirm")
-        result = IMessageClient(home=args.home).send_status(args.status)
+        try:
+            result = IMessageClient(home=args.home).send_status(args.status)
+        except (MessageWrapperError, ValueError, OSError, sqlite3.Error) as exc:
+            result = SendResult(
+                recipient="", submitted=None, verified=False,
+                delivery_status="unconfirmed", status_scope="message",
+                error=f"Unable to inspect message {args.status}: {exc}",
+            )
         payload = result.to_dict()
         if args.format == "json":
             print(json.dumps(payload, indent=2, ensure_ascii=False))

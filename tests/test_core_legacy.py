@@ -1830,6 +1830,21 @@ def test_applescript_sender_preserves_submission_when_verification_raises(tmp_pa
     assert "Verification unavailable" in result["error"]
 
 
+@pytest.mark.parametrize("service", ["iMessageLite", "unknown-service", "", None, "SMS", "MMS"])
+@pytest.mark.parametrize("delivered", [False, True])
+def test_legacy_only_known_sms_mms_services_verify_from_sent_flag(tmp_path, service, delivered):
+    db_path = tmp_path / "chat.db"
+    _make_send_status_db(db_path, tmp_path / "unused.png")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE message SET service = ?, is_sent = 1, is_delivered = ?",
+                     (service, int(delivered)))
+    sender = AppleScriptIMessageSender(db_path=db_path)
+
+    result = sender._send_visible("direct", "+15550100001", "hello", 0, 0, [])
+
+    assert result is (delivered or service in {"SMS", "MMS"})
+
+
 def test_applescript_sender_prefers_existing_direct_chat_for_attachments(tmp_path, monkeypatch):
     db_path = tmp_path / "chat.db"
     image_path = tmp_path / "photo.png"

@@ -746,7 +746,7 @@ class IMessageClient:
             # must not certify attachments whose state we have not checked.
             verified = False
             delivery_status = "attachments_unconfirmed"
-            send_error = "Attachment delivery is unverified; check Messages before retrying"
+            send_error = send_error or "Attachment delivery is unverified; check Messages before retrying"
         return SendResult(
             recipient=target,
             text=text,
@@ -2087,7 +2087,7 @@ end run
         if is_sent is True:
             return _SendVerification(
                 message=message,
-                verified=True,
+                verified=service in {"sms", "mms"},
                 delivery_status="sent",
                 message_service=message_service,
                 message_error=message_error,

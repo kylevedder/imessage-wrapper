@@ -289,7 +289,7 @@ def test_attachments_cannot_be_verified_by_text_delivery(sender, monkeypatch, tm
     assert result.verified is False
     assert result.delivery_status == "attachments_unconfirmed"
     assert result.text_delivery_status == ("delivered" if with_text else None)
-    assert "Attachment delivery is unverified" in result.error
+    assert result.error is not None
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM attachment").fetchone()[0] == 0
 
@@ -732,3 +732,54 @@ def test_known_chat_retains_observed_delivery_but_flags_explicit_service_mismatc
         assert "Requested sms, but Messages recorded iMessage" in result.error
     else:
         assert result.error is None
+
+
+@pytest.mark.parametrize("prior_error", ["automation", "verification", "service_mismatch"])
+def test_attachment_send_preserves_more_specific_error(sender, monkeypatch, tmp_path, prior_error):
+    client, path = sender
+    attachment = tmp_path / "file.txt"
+    attachment.write_text("file")
+    carrier_history(path)
+
+    def dispatch(cmd, **kwargs):
+        if prior_error == "automation":
+            raise subprocess.TimeoutExpired(cmd, timeout=1)
+        if prior_error == "service_mismatch":
+            outgoing_row(path, service="iMessage", is_sent=1, is_delivered=1)
+        return subprocess.CompletedProcess(cmd, 0, stdout="sent\n", stderr="")
+
+    monkeypatch.setattr(core.subprocess, "run", dispatch)
+    if prior_error == "verification":
+        def fail_verification(**kwargs):
+            raise sqlite3.OperationalError("synthetic read failure")
+        monkeypatch.setattr(client, "_wait_for_sent_message", fail_verification)
+    elif prior_error == "automation":
+        ticks = iter([0.0, 0.0, 11.0])
+        monkeypatch.setattr("imessage_wrapper.client.time.monotonic", lambda: next(ticks))
+        monkeypatch.setattr("imessage_wrapper.client.time.sleep", lambda _: None)
+
+    result = client.send(to=PHONE, service="sms", text="outgoing text", file_paths=[str(attachment)])
+
+    expected_error = {
+        "automation": "Automation outcome unknown",
+        "verification": "Verification unavailable",
+        "service_mismatch": "Requested sms, but Messages recorded iMessage",
+    }[prior_error]
+    assert result.delivery_status == "attachments_unconfirmed"
+    assert result.verified is False
+    assert expected_error in result.error
+
+
+@pytest.mark.parametrize("service", ["iMessageLite", "unknown-service", "", None, "SMS", "MMS"])
+@pytest.mark.parametrize("delivered", [False, True])
+def test_only_known_sms_mms_services_verify_from_sent_flag(sender, service, delivered):
+    client, path = sender
+    outgoing_row(path, service=service, is_sent=1, is_delivered=int(delivered))
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE chat SET service_name = NULL")
+
+    result = client.send_status(2)
+
+    assert result.sent is True
+    assert result.delivery_status == ("delivered" if delivered else "sent")
+    assert result.verified is (delivered or service in {"SMS", "MMS"})

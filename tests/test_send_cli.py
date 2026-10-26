@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from imessage_wrapper.models import SendResult
+from imessage_wrapper import MessageWrapperError
 
 
 @pytest.fixture
@@ -66,3 +69,31 @@ def test_failed_confirmation_is_not_printed_as_sent(cli, monkeypatch, capsys):
     assert "failed message" in output
     assert "sent message" not in output
     assert "Messages reported send error 4" in output
+
+
+@pytest.mark.parametrize("lookup_error,requested_id", [
+    (MessageWrapperError, 42), (ValueError, 0), (OSError, 42), (sqlite3.OperationalError, 42),
+])
+def test_status_lookup_error_is_unconfirmed_not_failed(cli, monkeypatch, capsys, lookup_error, requested_id):
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def send_status(self, message_id):
+            assert message_id == requested_id
+            raise lookup_error("synthetic lookup failure")
+
+        def send(self, **kwargs):
+            pytest.fail("lookup failure must never dispatch")
+
+    monkeypatch.setattr(cli, "IMessageClient", FakeClient)
+    monkeypatch.setattr("sys.argv", ["send", "--status", str(requested_id), "--format", "json"])
+
+    assert cli.main() == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["delivery_status"] == "unconfirmed"
+    assert result["submitted"] is None
+    assert result["verified"] is False
+    assert result["sent"] is False
+    assert result["status_scope"] == "message"
+    assert "synthetic lookup failure" in result["error"]
