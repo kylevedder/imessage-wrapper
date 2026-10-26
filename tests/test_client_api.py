@@ -623,7 +623,7 @@ def test_client_live_send_verifies_inserted_row(tmp_path, monkeypatch):
     make_messages_db(messages_db)
 
     def fake_run(cmd, input, text, capture_output, timeout, check, env):
-        assert cmd[:6] == ["osascript", "-", "iMessage;-;+15550100001", "sent text", "auto", "1"]
+        assert cmd[:6] == ["osascript", "-", "iMessage;-;+15550100001", "sent text", "imessage", "1"]
         conn = sqlite3.connect(messages_db)
         try:
             conn.execute(
@@ -641,13 +641,15 @@ def test_client_live_send_verifies_inserted_row(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, stdout="sent\n", stderr="")
 
     monkeypatch.setattr("imessage_wrapper.client.subprocess.run", fake_run)
-    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[], home=tmp_path)
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[], home=tmp_path, verification_timeout=0.01)
 
     result = client.send(chat_id=1, text="sent text")
 
-    assert result.sent is True
-    assert result.verified is True
-    assert result.delivery_status == "recorded"
+    assert result.submitted is True
+    assert result.sent is False
+    assert result.verified is False
+    assert result.delivery_status == "pending"
+    assert result.delivery_status == "pending"
     assert result.message_id == 2
     assert result.message_guid == "sent-guid"
 
@@ -681,7 +683,8 @@ def test_client_live_send_does_not_verify_preexisting_same_text_row(tmp_path, mo
 
     result = client.send(chat_id=1, text="repeat text")
 
-    assert result.sent is True
+    assert result.submitted is True
+    assert result.sent is False
     assert result.verified is False
     assert result.message_id is None
 
@@ -710,13 +713,15 @@ def test_client_live_send_verifies_attributed_body_text(tmp_path, monkeypatch):
 
     monkeypatch.setattr("imessage_wrapper.client.subprocess.run", fake_run)
     monkeypatch.setattr(core, "_decode_attributed_body_text_with_foundation", lambda value: "sent attributed text")
-    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[], home=tmp_path)
+    client = IMessageClient(messages_db_path=messages_db, contacts_db_paths=[], home=tmp_path, verification_timeout=0.01)
 
     result = client.send(chat_id=1, text="sent attributed text")
 
-    assert result.sent is True
-    assert result.verified is True
-    assert result.delivery_status == "recorded"
+    assert result.submitted is True
+    assert result.sent is False
+    assert result.verified is False
+    assert result.delivery_status == "pending"
+    assert result.delivery_status == "pending"
     assert result.message_id == 2
     assert result.message_guid == "sent-guid"
 
@@ -753,7 +758,8 @@ def test_client_live_send_waits_for_imessage_delivery_status(tmp_path, monkeypat
 
     result = client.send(chat_id=1, text="pending text")
 
-    assert result.sent is True
+    assert result.submitted is True
+    assert result.sent is False
     assert result.verified is False
     assert result.delivery_status == "pending"
     assert result.message_service == "iMessage"
@@ -845,7 +851,8 @@ def test_client_live_send_reports_messages_error_status(tmp_path, monkeypatch):
 
     result = client.send(chat_id=1, text="failed text")
 
-    assert result.sent is True
+    assert result.submitted is True
+    assert result.sent is False
     assert result.verified is False
     assert result.delivery_status == "failed"
     assert result.message_service == "RCS"

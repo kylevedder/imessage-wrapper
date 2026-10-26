@@ -1275,12 +1275,11 @@ on run argv
     tell application "Messages"
         set targetService to 1st service whose service type = iMessage
         try
-            set targetBuddy to buddy targetHandle of targetService
-            my sendPayload(targetBuddy, outgoingText, argv)
+            set targetRef to get buddy targetHandle of targetService
         on error
-            set targetParticipant to participant targetHandle of targetService
-            my sendPayload(targetParticipant, outgoingText, argv)
+            set targetRef to get participant targetHandle of targetService
         end try
+        my sendPayload(targetRef, outgoingText, argv)
     end tell
     return "sent"
 end run
@@ -1304,12 +1303,11 @@ on run argv
     set outgoingText to item 2 of argv
     tell application "Messages"
         try
-            set targetChat to chat id targetChatId
-            my sendPayload(targetChat, outgoingText, argv)
+            set targetChat to get chat id targetChatId
         on error
-            set targetChat to text chat id targetChatId
-            my sendPayload(targetChat, outgoingText, argv)
+            set targetChat to get text chat id targetChatId
         end try
+        my sendPayload(targetChat, outgoingText, argv)
     end tell
     return "sent"
 end run
@@ -1371,6 +1369,8 @@ end sendPayload
             self.timeout_seconds,
         )
         send_image_paths = self._stage_send_attachments(prepared_images)
+        completed = None
+        outcome_error = None
         try:
             completed = subprocess.run(
                 ["osascript", "-", script_recipient, message, *send_image_paths],
@@ -1392,7 +1392,7 @@ end sendPayload
                 len(stdout),
                 len(stderr),
             )
-            raise IMessageError(f"Timed out sending iMessage after {self.timeout_seconds}s") from exc
+            outcome_error = f"Automation outcome unknown after {self.timeout_seconds}s timeout; check Messages before retrying"
         except subprocess.CalledProcessError as exc:
             details = (exc.stderr or exc.stdout or "").strip() or "unknown AppleScript error"
             elapsed = time.monotonic() - start
@@ -1406,16 +1406,20 @@ end sendPayload
                 len(stdout),
                 len(stderr),
             )
-            raise IMessageError(f"Messages send failed: {details}") from exc
-        output = (completed.stdout or "").strip()
-        verified = self._wait_for_send(
-            verification_target[0],
-            verification_target[1],
-            message,
-            pre_send_rowid or 0,
-            pre_send_attachment_rowid or 0,
-            prepared_images,
-        )
+            outcome_error = f"Automation outcome unknown: {details}; check Messages before retrying"
+        output = (completed.stdout or "").strip() if completed else ""
+        try:
+            verified = self._wait_for_send(
+                verification_target[0],
+                verification_target[1],
+                message,
+                pre_send_rowid or 0,
+                pre_send_attachment_rowid or 0,
+                prepared_images,
+            )
+        except (IMessageError, sqlite3.Error, OSError) as exc:
+            verified = None
+            outcome_error = outcome_error or f"Verification unavailable: {exc}; check Messages before retrying"
         if verified is None:
             log.warning(
                 "AppleScript iMessage send completed but verification was unavailable target_kind=%s",
@@ -1431,18 +1435,21 @@ end sendPayload
             "AppleScript iMessage send completed target_kind=%s elapsed=%.3fs returncode=%s stdout_len=%d stderr_len=%d",
             verification_target[0],
             elapsed,
-            completed.returncode,
-            len(completed.stdout or ""),
-            len(completed.stderr or ""),
+            completed.returncode if completed else None,
+            len(completed.stdout or "") if completed else 0,
+            len(completed.stderr or "") if completed else 0,
         )
+        submitted = True if completed is not None or verified is True else None
         return {
             "mode": "live",
             "recipient": recipient,
             "message": message,
             "image_paths": prepared_images,
-            "sent": True,
+            "submitted": submitted,
+            "sent": verified is True,
             "verified": verified is True,
-            "result": output or "sent",
+            "result": (output or "sent") if verified is True else "submitted" if submitted else "unconfirmed",
+            "error": outcome_error if verified is not True else None,
         }
 
     def _messages_db_path(self) -> Path:
@@ -1753,10 +1760,16 @@ end sendPayload
         conn = self._connect_messages_db()
         try:
             try:
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(message)")}
+                status_columns = {"is_sent", "is_delivered", "date_delivered", "is_finished", "error"}
+                status_select = ", ".join(
+                    f"m.{name} AS send_{name}" if name in columns else f"NULL AS send_{name}"
+                    for name in ("service", "is_sent", "is_delivered", "date_delivered", "error")
+                )
                 if target_kind == "group":
                     rows = conn.execute(
-                        """
-                        SELECT m.ROWID, m.text, m.subject, m.attributedBody
+                        f"""
+                        SELECT m.ROWID, m.text, m.subject, m.attributedBody, {status_select}
                         FROM message m
                         JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
                         JOIN chat c ON c.ROWID = cmj.chat_id
@@ -1770,8 +1783,8 @@ end sendPayload
                     ).fetchall()
                 else:
                     rows = conn.execute(
-                        """
-                        SELECT DISTINCT m.ROWID, m.text, m.subject, m.attributedBody
+                        f"""
+                        SELECT DISTINCT m.ROWID, m.text, m.subject, m.attributedBody, {status_select}
                         FROM message m
                         LEFT JOIN handle h ON h.ROWID = m.handle_id
                         LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
@@ -1790,6 +1803,10 @@ end sendPayload
                     ).fetchall()
             except sqlite3.OperationalError:
                 return None
+            if columns & status_columns:
+                # A recorded row is not confirmation on schemas exposing send state.
+                # is_finished can precede is_sent; it is not a success/failure signal.
+                rows = [row for row in rows if self._row_confirms_send(row)]
             attachments_by_message = {}
             if image_paths:
                 attachments_by_message = _fetch_message_attachments(
@@ -1817,6 +1834,16 @@ end sendPayload
             if not text_seen and _normalize_message_text(extracted) == expected_text:
                 text_seen = True
         return text_seen and _attachments_match(expected_attachments, seen_attachments)
+
+    @staticmethod
+    def _row_confirms_send(row: sqlite3.Row) -> bool:
+        if row["send_error"] not in (None, 0):
+            return False
+        if row["send_is_delivered"] == 1 or (row["send_date_delivered"] or 0) > 0:
+            return True
+        if (row["send_service"] or "").casefold() in {"imessage", "rcs"}:
+            return False
+        return row["send_is_sent"] == 1
 
 
 def _prepare_image_paths(image_paths: list[str]) -> list[str]:
