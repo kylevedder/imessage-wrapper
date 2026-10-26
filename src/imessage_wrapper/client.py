@@ -1132,7 +1132,10 @@ class IMessageClient:
     def _connect_messages(self) -> sqlite3.Connection:
         if not self.messages_db_path.exists():
             raise core.IMessageError(f"Messages database not found at {self.messages_db_path}")
-        conn = sqlite3.connect(f"file:{self.messages_db_path}?mode=ro", uri=True)
+        try:
+            conn = sqlite3.connect(f"file:{self.messages_db_path}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            raise core.IMessageError(f"Cannot open Messages database read-only: {exc}") from exc
         conn.row_factory = sqlite3.Row
         core._register_lookup_functions(conn)
         return conn

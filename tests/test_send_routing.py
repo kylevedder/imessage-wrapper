@@ -783,3 +783,36 @@ def test_only_known_sms_mms_services_verify_from_sent_flag(sender, service, deli
     assert result.sent is True
     assert result.delivery_status == ("delivered" if delivered else "sent")
     assert result.verified is (delivered or service in {"SMS", "MMS"})
+
+
+@pytest.mark.parametrize("service", ["auto", "sms"])
+@pytest.mark.parametrize("options", [{"dry_run": True}, {"verify": False}])
+def test_missing_history_stops_before_dispatch_even_without_verification(tmp_path, monkeypatch, service, options):
+    client = IMessageClient(messages_db_path=tmp_path / "missing.db", contacts_db_paths=[],
+                            home=tmp_path, enrich_contacts=False)
+
+    def forbid_dispatch(*args, **kwargs):
+        pytest.fail("Unavailable route history must never dispatch")
+
+    monkeypatch.setattr(core.subprocess, "run", forbid_dispatch)
+    with pytest.raises(core.IMessageError, match="Messages database not found"):
+        client.send(to=PHONE, service=service, text="outgoing text", **options)
+
+
+def test_database_open_failure_becomes_wrapper_error_before_dispatch(tmp_path, monkeypatch):
+    path = tmp_path / "unreadable.db"
+    path.touch()
+    client = IMessageClient(messages_db_path=path, contacts_db_paths=[], home=tmp_path,
+                            enrich_contacts=False)
+    failure = sqlite3.OperationalError("synthetic access denied")
+
+    def fail_connect(database_uri, **kwargs):
+        assert database_uri.endswith("?mode=ro")
+        assert kwargs["uri"] is True
+        raise failure
+
+    monkeypatch.setattr(sqlite3, "connect", fail_connect)
+    monkeypatch.setattr(core.subprocess, "run", lambda *a, **k: pytest.fail("must not dispatch"))
+    with pytest.raises(core.IMessageError, match="Cannot open Messages database read-only") as error:
+        client.send(to=PHONE, text="outgoing text", dry_run=True)
+    assert error.value.__cause__ is failure

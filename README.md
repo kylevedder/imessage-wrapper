@@ -89,6 +89,10 @@ conversation to downgrade to SMS. A service that conflicts with an explicitly
 selected conversation is rejected before dispatch.
 `resolved_service` describes the intended route; `message_service` is what
 Messages actually recorded. An explicit service mismatch cannot be verified.
+Route selection, including previews and sends with verification disabled,
+requires readable Messages history. If that lookup is unavailable, sending
+stops before dispatch instead of silently guessing a service. Grant the Python
+process Full Disk Access to use these operations.
 
 Results distinguish `submitted` (the automation returned), `sent` (Messages
 reports sent or delivered), and `verified` (delivery confirmed for iMessage/RCS,
