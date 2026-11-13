@@ -26,7 +26,9 @@ def parse_args() -> argparse.Namespace:
 
     body = parser.add_mutually_exclusive_group(required=False)
     body.add_argument("--text", default="", help="Message body.")
-    body.add_argument("--text-file", help="Read message body from a UTF-8 text file.")
+    body.add_argument("--text-file", help="Read a UTF-8 body, trimming leading/trailing line breaks by default.")
+    parser.add_argument("--preserve-whitespace", action="store_true",
+                        help="Keep exact --text-file contents, including leading/trailing line breaks.")
 
     parser.add_argument("--file", action="append", default=[], help="Attachment path. Repeat for multiple files.")
     parser.add_argument("--service", choices=("auto", "imessage", "sms"), default="auto")
@@ -42,7 +44,11 @@ def parse_args() -> argparse.Namespace:
 
 def read_text(args: argparse.Namespace) -> str:
     if args.text_file:
-        return Path(args.text_file).expanduser().read_text(encoding="utf-8")
+        # Text files commonly end in a newline that is not part of the SMS.
+        # Keep interior formatting and offer an explicit literal-file mode.
+        with Path(args.text_file).expanduser().open(encoding="utf-8", newline="") as source:
+            text = source.read()
+        return text if args.preserve_whitespace else text.strip("\r\n")
     return args.text
 
 

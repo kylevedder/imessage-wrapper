@@ -29,6 +29,8 @@ uv --directory "$repo_root" run python \
 
 The script uses `imessage_wrapper.IMessageClient.send()`. Without `--confirm`, it uses `dry_run=True` and does not send.
 
+`--text-file` removes leading/trailing CR/LF line breaks by default so a file's final newline does not add an empty line to the message bubble. Interior paragraph breaks, spaces, and indentation are preserved. Use `--preserve-whitespace` with `--text-file` only when the recipient should receive those surrounding line breaks. Literal `--text` and the Python API preserve the supplied text. Preview the same input and options that will be used for the confirmed send.
+
 ## Safety Rules
 
 - Never use `--confirm` unless the current user request clearly authorizes sending.
@@ -51,6 +53,7 @@ The script uses `imessage_wrapper.IMessageClient.send()`. Without `--confirm`, i
 - `--to VALUE`: phone number, email, or handle for one-to-one sends.
 - `--chat-id N`, `--chat-identifier VALUE`, `--chat-guid VALUE`: target an existing chat.
 - `--text TEXT` or `--text-file PATH`: message body.
+- `--preserve-whitespace`: keep exact `--text-file` contents, including surrounding line breaks.
 - `--file PATH`: repeat for attachments.
 - `--service auto|imessage|sms`: transport preference; defaults to `auto`.
 - `--verify` / `--no-verify`: send verification behavior.

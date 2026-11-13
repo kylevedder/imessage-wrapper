@@ -97,3 +97,54 @@ def test_status_lookup_error_is_unconfirmed_not_failed(cli, monkeypatch, capsys,
     assert result["sent"] is False
     assert result["status_scope"] == "message"
     assert "synthetic lookup failure" in result["error"]
+
+
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_file_body_trims_outer_newlines_for_preview_and_send(cli, monkeypatch, capsys, tmp_path, confirm, newline):
+    expected = f"Hello.{newline}{newline}  Second paragraph."
+    contents = f"{newline}{newline}{expected}{newline}"
+    body = tmp_path / "message.txt"
+    body.write_bytes(contents.encode("utf-8"))
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def send(self, **kwargs):
+            assert kwargs["text"] == expected
+            assert kwargs["dry_run"] is not confirm
+            return SendResult(recipient="synthetic", text=kwargs["text"],
+                              dry_run=kwargs["dry_run"], verified=confirm)
+
+    monkeypatch.setattr(cli, "IMessageClient", FakeClient)
+    monkeypatch.setattr("sys.argv", ["send", "--to", "+15550100001", "--text-file", str(body),
+                                     "--format", "json", *(["--confirm"] if confirm else [])])
+    assert cli.main() == 0
+    assert json.loads(capsys.readouterr().out)["text"] == expected
+    assert body.read_bytes() == contents.encode("utf-8")
+
+
+@pytest.mark.parametrize("source", ["literal", "file"])
+def test_explicit_whitespace_is_preserved(cli, monkeypatch, capsys, tmp_path, source):
+    contents = "\r\n\r\n  Hello.\r\n\r\nSecond paragraph. \t\r\n"
+    if source == "file":
+        body = tmp_path / "message.txt"
+        body.write_bytes(contents.encode("utf-8"))
+        options = ["--text-file", str(body), "--preserve-whitespace"]
+    else:
+        options = ["--text", contents]
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def send(self, **kwargs):
+            assert kwargs["text"] == contents
+            assert kwargs["dry_run"] is True
+            return SendResult(recipient="synthetic", text=kwargs["text"], dry_run=True)
+
+    monkeypatch.setattr(cli, "IMessageClient", FakeClient)
+    monkeypatch.setattr("sys.argv", ["send", "--to", "+15550100001", *options, "--format", "json"])
+    assert cli.main() == 0
+    assert json.loads(capsys.readouterr().out)["text"] == contents
