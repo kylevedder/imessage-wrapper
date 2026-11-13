@@ -79,6 +79,12 @@ message, and count each attachment once even when join rows are duplicated.
 
 ### Sending and checking delivery
 
+The `send-imessage` skill CLI trims leading/trailing CR/LF line breaks from
+`--text-file` bodies, preventing a text file's final newline from adding an
+empty line to the message bubble. Interior paragraph breaks and indentation
+are preserved. Use `--text-file PATH --preserve-whitespace` for exact file
+contents. Literal `--text` and the Python API preserve the supplied text.
+
 `service="auto"` prefers an exact existing direct conversation and its latest
 inbound or confirmed-delivered service history. Unconfirmed/failed iMessage
 attempts do not displace a known RCS route. Equally supported conversations
